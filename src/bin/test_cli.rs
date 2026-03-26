@@ -48,6 +48,21 @@ enum Commands {
         #[arg(short, long, default_value = "test payload")]
         data: String,
     },
+
+    /// Fetch a blob from a remote node by BLAKE3 hash
+    Fetch {
+        /// Remote node Endpoint ID
+        #[arg(short, long)]
+        node: String,
+
+        /// BLAKE3 hash (hex) of the blob to fetch
+        #[arg(long)]
+        hash: String,
+
+        /// Optional output file path
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -77,6 +92,19 @@ async fn main() -> Result<()> {
         } => {
             let node_id = tdf_iroh_s3::test_cli::iroh_client::parse_endpoint_id(&node)?;
             tdf_iroh_s3::test_cli::push::push_tdf(node_id, &attribute, data.as_bytes()).await?;
+        }
+        Commands::Fetch {
+            node,
+            hash,
+            output,
+        } => {
+            let node_id = tdf_iroh_s3::test_cli::iroh_client::parse_endpoint_id(&node)?;
+            tdf_iroh_s3::test_cli::fetch::fetch_blob(
+                node_id,
+                &hash,
+                output.as_deref(),
+            )
+            .await?;
         }
     }
 
