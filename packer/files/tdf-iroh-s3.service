@@ -1,0 +1,22 @@
+[Unit]
+Description=TDF-Iroh-S3 Node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tdf-iroh-s3
+Group=tdf-iroh-s3
+ExecStartPre=/usr/local/bin/tdf-iroh-s3-bootstrap
+ExecStart=/usr/local/bin/tdf-iroh-s3 --config /etc/tdf-iroh-s3/config.toml
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/tdf-iroh-s3 /etc/tdf-iroh-s3
+
+[Install]
+WantedBy=multi-user.target
