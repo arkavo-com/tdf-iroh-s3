@@ -1,6 +1,31 @@
 use tdf_iroh_s3::config::Config;
 
 #[test]
+fn test_config_default_data_dir() {
+    let toml_str = r#"
+[s3]
+bucket = "test-bucket"
+region = "us-east-1"
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    assert_eq!(config.iroh.data_dir, "/var/lib/tdf-iroh-s3/data");
+}
+
+#[test]
+fn test_config_custom_data_dir() {
+    let toml_str = r#"
+[iroh]
+data_dir = "/tmp/my-data"
+
+[s3]
+bucket = "test-bucket"
+region = "us-east-1"
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    assert_eq!(config.iroh.data_dir, "/tmp/my-data");
+}
+
+#[test]
 fn test_parse_minimal_config() {
     let toml_str = r#"
 [s3]

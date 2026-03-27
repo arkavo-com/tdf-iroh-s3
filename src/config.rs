@@ -16,6 +16,8 @@ pub struct IrohConfig {
     pub bind_port: u16,
     #[serde(default = "default_secret_key_path")]
     pub secret_key_path: String,
+    #[serde(default = "default_data_dir")]
+    pub data_dir: String,
 }
 
 impl Default for IrohConfig {
@@ -23,6 +25,7 @@ impl Default for IrohConfig {
         Self {
             bind_port: default_bind_port(),
             secret_key_path: default_secret_key_path(),
+            data_dir: default_data_dir(),
         }
     }
 }
@@ -33,6 +36,10 @@ fn default_bind_port() -> u16 {
 
 fn default_secret_key_path() -> String {
     "/var/lib/tdf-iroh-s3/secret.key".to_string()
+}
+
+fn default_data_dir() -> String {
+    "/var/lib/tdf-iroh-s3/data".to_string()
 }
 
 #[derive(Debug, Deserialize)]
