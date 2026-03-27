@@ -16,7 +16,7 @@ fn test_config(data_dir: &str) -> Config {
     Config {
         iroh: IrohConfig {
             bind_port: 0, // Random port
-            secret_key_path: String::new(),
+            secret_key_param: String::new(),
             data_dir: data_dir.to_string(),
         },
         s3: S3Config {

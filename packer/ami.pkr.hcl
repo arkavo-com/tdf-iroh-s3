@@ -12,9 +12,10 @@ variable "aws_region" {
   default = "us-east-1"
 }
 
-variable "binary_path" {
+variable "binary_s3_uri" {
   type        = string
-  description = "Path to the compiled tdf-iroh-s3 binary"
+  description = "S3 URI of the gzipped tdf-iroh-s3 binary (e.g. s3://bucket/path/tdf-iroh-s3.gz)"
+  default     = "s3://arkavo-report/packer/tdf-iroh-s3.gz"
 }
 
 variable "ami_name_prefix" {
@@ -24,12 +25,12 @@ variable "ami_name_prefix" {
 
 source "amazon-ebs" "al2023" {
   ami_name      = "${var.ami_name_prefix}-{{timestamp}}"
-  instance_type = "t3.medium"
+  instance_type = "t4g.medium"
   region        = var.aws_region
 
   source_ami_filter {
     filters = {
-      name                = "al2023-ami-*-x86_64"
+      name                = "al2023-ami-*-arm64"
       root-device-type    = "ebs"
       virtualization-type = "hvm"
     }
@@ -38,6 +39,9 @@ source "amazon-ebs" "al2023" {
   }
 
   ssh_username = "ec2-user"
+  ssh_timeout  = "5m"
+
+  iam_instance_profile = "packer-s3-read"
 
   tags = {
     Name    = "${var.ami_name_prefix}"
@@ -48,9 +52,11 @@ source "amazon-ebs" "al2023" {
 build {
   sources = ["source.amazon-ebs.al2023"]
 
-  provisioner "file" {
-    source      = var.binary_path
-    destination = "/tmp/tdf-iroh-s3"
+  provisioner "shell" {
+    inline = [
+      "aws s3 cp ${var.binary_s3_uri} /tmp/tdf-iroh-s3.gz",
+      "gunzip -f /tmp/tdf-iroh-s3.gz"
+    ]
   }
 
   provisioner "file" {
@@ -64,12 +70,12 @@ build {
   }
 
   provisioner "shell" {
-    script = "scripts/setup-user.sh"
+    script          = "scripts/setup-user.sh"
     execute_command = "sudo bash '{{.Path}}'"
   }
 
   provisioner "shell" {
-    script = "scripts/install.sh"
+    script          = "scripts/install.sh"
     execute_command = "sudo bash '{{.Path}}'"
   }
 }
