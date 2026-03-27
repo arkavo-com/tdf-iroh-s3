@@ -12,6 +12,7 @@ use tracing::{error, info, warn};
 
 use crate::config::Config;
 use crate::ingest::ingest_from_store;
+use crate::secret_key;
 use crate::store::s3::S3Client;
 
 pub struct TdfIrohNode {
@@ -37,7 +38,16 @@ impl TdfIrohNode {
             .await
             .context("Failed to load FsStore")?;
 
-        let endpoint = Endpoint::builder(presets::N0)
+        let mut builder = Endpoint::builder(presets::N0);
+        if !config.iroh.secret_key_param.is_empty() {
+            let secret_key =
+                secret_key::load_or_create(&config.iroh.secret_key_param, &config.s3.region)
+                    .await
+                    .context("Failed to load or create node secret key")?;
+            builder = builder.secret_key(secret_key);
+        }
+
+        let endpoint = builder
             .bind_addr((Ipv4Addr::UNSPECIFIED, config.iroh.bind_port))
             .context("Invalid bind address")?
             .bind()

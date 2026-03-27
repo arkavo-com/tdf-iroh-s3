@@ -45,7 +45,7 @@ fn test_parse_full_config() {
     let toml_str = r#"
 [iroh]
 bind_port = 9999
-secret_key_path = "/tmp/test.key"
+secret_key_param = "/my-app/node-secret-key"
 
 [s3]
 bucket = "prod-bucket"
@@ -63,7 +63,7 @@ trusted_public_keys = ["/tmp/key1.pem", "/tmp/key2.pem"]
 "#;
     let config: Config = toml::from_str(toml_str).unwrap();
     assert_eq!(config.iroh.bind_port, 9999);
-    assert_eq!(config.iroh.secret_key_path, "/tmp/test.key");
+    assert_eq!(config.iroh.secret_key_param, "/my-app/node-secret-key");
     assert_eq!(config.s3.prefix, "blobs/");
     assert_eq!(config.validation.required_attributes.len(), 1);
     assert!(config.validation.assertion.enabled);

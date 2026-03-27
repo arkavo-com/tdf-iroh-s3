@@ -365,6 +365,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-ssm"
+version = "1.106.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "02c8deffb8e0e7b8729b8b6ed9010c99cb10c61f01aaca86a8f3771cbf94cfcf"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http 0.63.5",
+ "aws-smithy-json 0.62.4",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-sso"
 version = "1.95.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4756,12 +4780,16 @@ dependencies = [
  "anyhow",
  "aws-config",
  "aws-sdk-s3",
+ "aws-sdk-ssm",
  "blake3",
  "bytes",
  "clap",
+ "hex",
  "iroh",
+ "iroh-base",
  "iroh-blobs",
  "opentdf",
+ "rand 0.9.2",
  "serde",
  "tempfile",
  "thiserror 2.0.18",
