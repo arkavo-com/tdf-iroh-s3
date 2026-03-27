@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use iroh_blobs::Hash;
-use iroh_blobs::api::blobs::BlobStatus;
 use iroh_blobs::store::fs::FsStore;
 use tracing::info;
 
@@ -50,7 +49,7 @@ pub async fn ingest_blob(
 }
 
 /// Read a blob from the FsStore by hash, validate it, and upload to S3.
-/// Returns Ok(Some(result)) on success, Ok(None) if the blob is not yet complete,
+/// Returns Ok(Some(result)) on success, Ok(None) if the blob is not yet available,
 /// or Err if validation/upload fails.
 pub async fn ingest_from_store(
     hash: Hash,
@@ -58,24 +57,13 @@ pub async fn ingest_from_store(
     validation_config: &crate::config::ValidationConfig,
     s3_client: &S3Client,
 ) -> Result<Option<IngestResult>> {
-    // Check if blob is complete in the store
-    let status = store
-        .status(hash)
-        .await
-        .map_err(|e| anyhow::anyhow!("{}", e))
-        .context("Failed to check blob status")?;
-
-    match status {
-        BlobStatus::Complete { .. } => {}
-        _ => return Ok(None),
-    }
-
-    // Read blob bytes
-    let data = store
-        .get_bytes(hash)
-        .await
-        .map_err(|e| anyhow::anyhow!("{}", e))
-        .context("Failed to read blob from store")?;
+    // Try to read blob bytes directly. For pushed blobs, get_bytes() works
+    // even when status() returns NotFound (it reads from file storage,
+    // bypassing the database metadata which updates asynchronously).
+    let data = match store.get_bytes(hash).await {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(None), // Blob not yet available
+    };
 
     // Delegate to the existing ingest pipeline
     ingest_blob(&data, validation_config, s3_client).await.map(Some)
