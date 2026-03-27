@@ -48,10 +48,10 @@ fn attribute_in_policy(policy_json: &str, fqn: &str) -> Result<bool> {
     }
 
     // If the FQN includes a value, also verify the value appears
-    if let Some(value) = parsed.get_value() {
-        if !policy_json.contains(value) {
-            return Ok(false);
-        }
+    if let Some(value) = parsed.get_value()
+        && !policy_json.contains(value)
+    {
+        return Ok(false);
     }
 
     Ok(true)

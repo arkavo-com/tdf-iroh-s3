@@ -119,7 +119,7 @@ impl S3Client {
             Ok(_) => Ok(true),
             Err(e) => {
                 if e.as_service_error()
-                    .map_or(false, |se| se.is_not_found())
+                    .is_some_and(|se| se.is_not_found())
                 {
                     Ok(false)
                 } else {
@@ -175,7 +175,7 @@ impl S3Client {
             }
             Err(e) => {
                 if e.as_service_error()
-                    .map_or(false, |se| se.is_no_such_key())
+                    .is_some_and(|se| se.is_no_such_key())
                 {
                     Ok(None)
                 } else {
