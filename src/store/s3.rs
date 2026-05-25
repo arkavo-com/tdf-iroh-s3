@@ -1,11 +1,23 @@
 use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
 use bytes::Bytes;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 pub struct S3Client {
     client: Client,
     bucket: String,
     prefix: String,
+}
+
+/// Outcome of a conditional PUT (`If-None-Match: *`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionalPut {
+    /// The object did not exist; write succeeded.
+    Wrote,
+    /// An object already existed at this key; write was rejected by the
+    /// precondition (HTTP 412).
+    PreconditionFailed,
 }
 
 impl S3Client {
@@ -35,6 +47,11 @@ impl S3Client {
             bucket: bucket.to_string(),
             prefix: prefix.to_string(),
         }
+    }
+
+    /// The configured key prefix (e.g. `"env/prod/"`).
+    pub fn prefix(&self) -> &str {
+        &self.prefix
     }
 
     pub fn blob_key(&self, hash_hex: &str) -> String {
@@ -194,5 +211,159 @@ impl S3Client {
             .await
             .context("Failed to DELETE tag from S3")?;
         Ok(())
+    }
+
+    /// PUT raw bytes at an arbitrary key (i.e. not the BLAKE3-keyed blob path).
+    pub async fn put_object_bytes(&self, key: &str, data: Bytes) -> Result<()> {
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .body(data.into())
+            .send()
+            .await
+            .with_context(|| format!("Failed to PUT object '{key}' to S3"))?;
+        Ok(())
+    }
+
+    /// PUT raw bytes only if the key does not already exist (`If-None-Match: *`).
+    /// Returns [`ConditionalPut::PreconditionFailed`] if an object exists.
+    pub async fn put_object_bytes_if_none_match(
+        &self,
+        key: &str,
+        data: Bytes,
+    ) -> Result<ConditionalPut> {
+        let res = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .if_none_match("*")
+            .body(data.into())
+            .send()
+            .await;
+
+        match res {
+            Ok(_) => Ok(ConditionalPut::Wrote),
+            Err(e) => {
+                let status = e.raw_response().map(|r| r.status().as_u16());
+                if status == Some(412) {
+                    Ok(ConditionalPut::PreconditionFailed)
+                } else {
+                    Err(anyhow::anyhow!(
+                        "Failed conditional PUT for key '{key}': {e}"
+                    ))
+                }
+            }
+        }
+    }
+
+    /// HEAD a generic key. Returns `true` if the object exists, `false` for 404.
+    pub async fn head_object(&self, key: &str) -> Result<bool> {
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                if e.as_service_error().is_some_and(|se| se.is_not_found()) {
+                    Ok(false)
+                } else {
+                    Err(anyhow::anyhow!("Failed to HEAD object '{key}' in S3: {e}"))
+                }
+            }
+        }
+    }
+
+    /// GET a generic key. Returns `None` for 404.
+    pub async fn get_object_bytes(&self, key: &str) -> Result<Option<Bytes>> {
+        match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                let data = resp
+                    .body
+                    .collect()
+                    .await
+                    .with_context(|| format!("Failed to read object '{key}' body"))?;
+                Ok(Some(data.into_bytes()))
+            }
+            Err(e) => {
+                if e.as_service_error().is_some_and(|se| se.is_no_such_key()) {
+                    Ok(None)
+                } else {
+                    Err(anyhow::anyhow!("Failed to GET object '{key}' from S3: {e}"))
+                }
+            }
+        }
+    }
+
+    /// PUT a value serialized as pretty JSON with content-type `application/json`.
+    pub async fn put_json<T: Serialize>(&self, key: &str, value: &T) -> Result<()> {
+        let body = serde_json::to_vec_pretty(value)
+            .with_context(|| format!("Failed to serialize JSON for key '{key}'"))?;
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .content_type("application/json")
+            .body(Bytes::from(body).into())
+            .send()
+            .await
+            .with_context(|| format!("Failed to PUT JSON '{key}' to S3"))?;
+        Ok(())
+    }
+
+    /// GET a JSON value. Returns `None` if the object does not exist.
+    pub async fn get_json<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
+        let Some(bytes) = self.get_object_bytes(key).await? else {
+            return Ok(None);
+        };
+        let parsed: T = serde_json::from_slice(&bytes)
+            .with_context(|| format!("Failed to parse JSON at key '{key}'"))?;
+        Ok(Some(parsed))
+    }
+
+    /// List object keys with the given prefix. Pages internally.
+    pub async fn list_keys(&self, prefix: &str) -> Result<Vec<String>> {
+        let mut keys = Vec::new();
+        let mut continuation: Option<String> = None;
+        loop {
+            let req = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(prefix);
+            let req = match &continuation {
+                Some(token) => req.continuation_token(token),
+                None => req,
+            };
+            let resp = req
+                .send()
+                .await
+                .with_context(|| format!("Failed to LIST objects under '{prefix}'"))?;
+            if let Some(objects) = resp.contents {
+                for obj in objects {
+                    if let Some(k) = obj.key {
+                        keys.push(k);
+                    }
+                }
+            }
+            if resp.is_truncated.unwrap_or(false) {
+                continuation = resp.next_continuation_token;
+            } else {
+                break;
+            }
+        }
+        Ok(keys)
     }
 }
