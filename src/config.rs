@@ -8,6 +8,9 @@ pub struct Config {
     pub s3: S3Config,
     #[serde(default)]
     pub validation: ValidationConfig,
+    #[serde(default)]
+    pub catalog: CatalogConfig,
+    pub auth: AuthConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,6 +67,44 @@ pub struct AssertionConfig {
     pub enabled: bool,
     #[serde(default)]
     pub trusted_public_keys: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct CatalogConfig {
+    #[serde(default = "default_catalog_data_dir")]
+    pub data_dir: String,
+}
+
+impl Default for CatalogConfig {
+    fn default() -> Self {
+        Self {
+            data_dir: default_catalog_data_dir(),
+        }
+    }
+}
+
+fn default_catalog_data_dir() -> String {
+    "/var/lib/tdf-iroh-s3/docs".to_string()
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct AuthConfig {
+    /// URL of the COSE_KeySet endpoint (`application/cose-key-set+cbor`).
+    /// For arkavo: `https://identity.arkavo.net/.well-known/cose-keys`.
+    pub cose_keys_url: String,
+    pub issuer: String,
+    #[serde(default = "default_refresh_interval_secs")]
+    pub refresh_interval_secs: u64,
+    #[serde(default = "default_clock_skew_secs")]
+    pub clock_skew_secs: i64,
+}
+
+fn default_refresh_interval_secs() -> u64 {
+    300
+}
+
+fn default_clock_skew_secs() -> i64 {
+    60
 }
 
 impl Config {

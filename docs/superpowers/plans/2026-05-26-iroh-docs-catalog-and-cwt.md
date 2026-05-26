@@ -6,7 +6,10 @@
 
 **Goal:** Replace the S3-backed publish event log with an `iroh-docs`
 replica, and gate every write to that replica with a CWT (COSE_Sign1)
-verified against a JWKS URL in config.
+verified against a COSE_KeySet endpoint (`application/cose-key-set+cbor`)
+configured in the node. The reference issuer is
+`https://identity.arkavo.net`; its discovery document advertises the
+endpoint as `arkavo_cose_keys_uri`.
 
 **Architecture:** One node-local `iroh-docs` replica holds all publish
 events under `creators/{creator_id}/events/{seq:020}` keys. **The event
@@ -19,9 +22,11 @@ event and embeds the raw CWT in the event payload for audit. Nothing is
 written back to the replica besides events — no snapshots, no signed
 projection.
 
-**Tech Stack:** `iroh-docs` 0.99, `coset` 0.3 (COSE_Sign1), `ciborium`
-(CBOR), `p256` (ES256 verify), `arc-swap` (JWKS cache), `reqwest` (JWKS
-fetch), `base64`.
+**Tech Stack:** `iroh-docs` 0.97 (pairs with `iroh` 0.97 / `iroh-blobs`
+0.99), `coset` 0.4 (COSE_Sign1 + COSE_KeySet), `ciborium` (CBOR),
+`p256` (ES256 verify), `arc-swap` (key cache), `reqwest` (HTTP fetch
+of `application/cose-key-set+cbor`), `base64` (embedded CWT in event
+payload).
 
 **Spec:** `docs/superpowers/specs/2026-05-26-iroh-docs-catalog-and-cwt.md`
 
@@ -33,9 +38,9 @@ fetch), `base64`.
 |------|--------|----------------|
 | `Cargo.toml` | Modify | Add `iroh-docs`, `coset`, `ciborium`, `p256`, `arc-swap`, `base64` |
 | `src/config.rs` | Modify | New `[catalog]` and `[auth]` config sections |
-| `src/auth/mod.rs` | Create | Re-export `Verifier`, `VerifiedClaims` |
+| `src/auth/mod.rs` | Create | Re-export `Verifier`, `VerifiedClaims`, `CoseKeyCache` |
 | `src/auth/cwt.rs` | Create | COSE_Sign1 parse + signature verify + claim checks |
-| `src/auth/jwks.rs` | Create | JWKS fetch, parse, cache, JWK→COSE-key |
+| `src/auth/cose_keys.rs` | Create | COSE_KeySet (CBOR) fetch, parse, cache, refresh |
 | `src/auth/test_signer.rs` | Create (cfg test/feature) | Test fixture that mints valid CWTs |
 | `src/catalog/types.rs` | Modify | Add `EventAuthorization`; extend `PublishEvent`; replace `Catalog` with `CatalogView { creator_id, entries }`; delete `CatalogSignature`, `CatalogDraft` |
 | `src/catalog/mod.rs` | Modify | `build_catalog` now returns `CatalogView`; delete `finalize`, `canonical_json`, `sign_placeholder` |
@@ -58,21 +63,20 @@ fetch), `base64`.
 
 **Files:** `Cargo.toml`
 
-- [ ] **Step 1: Add crates**
+- [x] **Step 1: Add crates**
 
   In `[dependencies]`, add:
   ```toml
-  coset = "0.3"
+  coset = "0.4"
   ciborium = "0.2"
   p256 = { version = "0.13", features = ["ecdsa"] }
   arc-swap = "1"
   base64 = "0.22"
-  iroh-docs = "0.99"
+  iroh-docs = "0.97"   # pairs with iroh 0.97 / iroh-blobs 0.99
+  reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
   ```
-  If `reqwest` is not already present, add `reqwest = { version = "0.12",
-  features = ["rustls-tls", "json"], default-features = false }`.
 
-- [ ] **Step 2: Verify it builds**
+- [x] **Step 2: Verify it builds**
 
   Run `cargo build`. Must compile with no code changes yet.
 
@@ -80,19 +84,22 @@ fetch), `base64`.
 
 **Files:** `src/config.rs`, `tests/config_test.rs`
 
-- [ ] **Step 1: Failing tests for `[auth]` and `[catalog]` parsing**
+- [x] **Step 1: Failing tests for `[auth]` and `[catalog]` parsing**
 
-  Add tests that load a TOML containing `[auth] jwks_url = "..."`,
+  Add tests that load a TOML containing `[auth] cose_keys_url = "..."`,
   `issuer = "..."`, and `[catalog] data_dir = "..."`. Assert fields parse;
   assert defaults (`refresh_interval_secs = 300`, `clock_skew_secs = 60`,
-  `data_dir = "/var/lib/tdf-iroh-s3/docs"`).
+  `data_dir = "/var/lib/tdf-iroh-s3/docs"`). `[auth]` is **required** —
+  add a test that a TOML without it fails to parse so the node cannot
+  silently boot without a verifier.
 
-- [ ] **Step 2: Add `AuthConfig` and `CatalogConfig` structs**
+- [x] **Step 2: Add `AuthConfig` and `CatalogConfig` structs**
 
   ```rust
   #[derive(Debug, Deserialize, Clone)]
   pub struct AuthConfig {
-      pub jwks_url: String,
+      /// URL of the COSE_KeySet endpoint (`application/cose-key-set+cbor`).
+      pub cose_keys_url: String,
       pub issuer: String,
       #[serde(default = "default_refresh_interval_secs")]
       pub refresh_interval_secs: u64,
@@ -102,38 +109,41 @@ fetch), `base64`.
   ```
   Add `pub catalog: CatalogConfig` and `pub auth: AuthConfig` to `Config`.
 
-- [ ] **Step 3: Tests pass**
+- [x] **Step 3: Tests pass**
 
 ### Task A3: COSE_Sign1 verify
 
 **Files:** `src/auth/cwt.rs`, `src/auth/mod.rs`, `src/lib.rs`,
 `src/auth/test_signer.rs`, `tests/auth_cwt_test.rs`
 
-- [ ] **Step 1: Implement `test_signer`**
+- [x] **Step 1: Implement `test_signer`**
 
   Behind `#[cfg(any(test, feature = "test-fixtures"))]`. Generates a
   P-256 keypair, exposes:
   ```rust
-  pub fn jwks_json(&self) -> String;
+  pub fn cose_key_set(&self) -> Vec<u8>;     // CBOR bytes for the endpoint
+  pub fn cose_key_cache(&self) -> Arc<CoseKeyCache>; // bypass HTTP for tests
   pub fn mint(&self, claims: TestClaims) -> Vec<u8>;
   ```
   `mint` builds a COSE_Sign1 with protected header `alg = ES256`,
-  `kid = <test-kid>`, and CBOR-encoded claims map per RFC 8392.
+  `kid = <test-kid>` (bytes), and CBOR-encoded claims map per RFC 8392.
 
-- [ ] **Step 2: Failing test — verifier accepts a freshly minted CWT**
+- [x] **Step 2: Failing test — verifier accepts a freshly minted CWT**
 
-  In `tests/auth_cwt_test.rs`, spin up the test signer, publish its JWKS
-  via a `httptest::Server`, point a `Verifier` at it, mint a CWT, call
-  `verify`, assert claims.
+  In `tests/auth_cwt_test.rs`, spin up the test signer, build a static
+  `CoseKeyCache` (no HTTP) plus one separate test using a
+  `tokio::net::TcpListener` to serve the CBOR `CoseKeySet` over real
+  HTTP, point a `Verifier` at each, mint a CWT, call `verify`, assert
+  claims.
 
-- [ ] **Step 3: Implement `Verifier::verify`**
+- [x] **Step 3: Implement `Verifier::verify`**
 
-  - Parse with `coset::CoseSign1::from_slice`.
-  - Pull `kid` from protected header; look up COSE key in JWKS cache;
-    refresh-once on miss.
+  - Parse with `coset::CoseSign1::from_slice` (accept bare and tag(18)).
+  - Pull `kid` (bytes) from protected header; look up in
+    `CoseKeyCache`; refresh-once on miss.
   - Verify signature with `p256::ecdsa::VerifyingKey` over the
-    `Sig_structure` bytes (`coset` builds these for you).
-  - Decode payload CBOR map with `ciborium::de`.
+    `Sig_structure` bytes (`CoseSign1::verify_signature` builds them).
+  - Decode payload CBOR map via `coset::cwt::ClaimsSet::from_cbor_value`.
   - Check `iss == config.issuer`, `exp > now - clock_skew`,
     `iat < now + clock_skew`, `scope.contains("catalog.write")`,
     `sub` and `campaign_id` present and non-empty.
@@ -141,34 +151,42 @@ fetch), `base64`.
     equality.
   - Return `VerifiedClaims`.
 
-- [ ] **Step 4: Failing tests — verifier rejects bad cases**
+- [x] **Step 4: Failing tests — verifier rejects bad cases**
 
   Wrong issuer; expired; tampered signature; missing scope; `sub` empty;
   unknown `kid` (after one refresh attempt). Add each as a separate
   `#[test]` so failure messages are precise.
 
-- [ ] **Step 5: Implement rejections; tests pass**
+- [x] **Step 5: Implement rejections; tests pass**
 
-### Task A4: JWKS cache and refresh
+### Task A4: COSE_KeySet cache and refresh
 
-**Files:** `src/auth/jwks.rs`
+**Files:** `src/auth/cose_keys.rs`
 
-- [ ] **Step 1: Background refresh task**
+- [x] **Step 1: Background refresh task**
 
-  `JwksCache::spawn(url, interval, http_client) -> Arc<Self>` returns a
+  `CoseKeyCache::spawn(url, interval, http_client) -> Arc<Self>` returns a
   handle; an internal tokio task refreshes on the configured interval and
-  swaps the parsed `HashMap<Kid, CoseKey>` via `ArcSwap`.
+  swaps the parsed `HashMap<Kid, VerifyingKey>` via `ArcSwap`.
 
-- [ ] **Step 2: On-demand refresh**
+- [x] **Step 2: On-demand refresh**
 
   `force_refresh()` rate-limited to one-per-second using
   `tokio::sync::Mutex<Instant>`. Called by the verifier when `kid` is not
   in the current snapshot.
 
-- [ ] **Step 3: Test — `force_refresh` rate-limit**
+- [x] **Step 3: Test — `force_refresh` rate-limit**
 
-  Hammer 10 concurrent `force_refresh` calls; assert at most 2 HTTP
-  requests landed (one immediate, one after the 1s gate).
+  Hammer 10 concurrent `force_refresh` calls against a local
+  `TcpListener` serving an empty `CoseKeySet`; assert at most 2 fetches
+  landed (initial + at most one within the 1s gate).
+
+- [x] **Step 4: Test — parses the real arkavo CoseKeySet bytes**
+
+  Embed the 113-byte response captured from
+  `https://identity.arkavo.net/.well-known/cose-keys` as a fixture and
+  assert it parses into exactly one P-256 key. This guards against
+  regressions if `coset` or `p256` changes anything load-bearing.
 
 ---
 

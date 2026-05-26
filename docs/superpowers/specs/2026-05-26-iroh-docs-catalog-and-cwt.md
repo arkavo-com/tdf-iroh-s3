@@ -15,9 +15,11 @@ Two coupled changes to the catalog layer:
 2. **Write authorization.** Today there is no authorization on the publish
    path at all: anyone who can reach the node's API can append an event for
    any `creator_id`. We need writes to be gated by a CWT (COSE_Sign1, RFC
-   8392) signed by an issuer whose verification key comes from a JWKS URL
-   configured on the node. The CWT's claims bind the event to a specific
-   creator and campaign.
+   8392) signed by an issuer whose verification key comes from a
+   **COSE_KeySet endpoint** (`application/cose-key-set+cbor`) configured on
+   the node. The CWT's claims bind the event to a specific creator and
+   campaign. The reference issuer is `https://identity.arkavo.net`, whose
+   discovery document advertises this endpoint as `arkavo_cose_keys_uri`.
 
 Blob push/get over `iroh-blobs` is **out of scope** for CWT gating — that
 layer keeps its current NodeId-based access pattern through the existing
@@ -96,8 +98,9 @@ seq observed).
 
 ### CWT verifier
 
-A new `crate::auth` module verifies COSE_Sign1 CWTs against a JWKS fetched
-from a configured URL.
+A new `crate::auth` module verifies COSE_Sign1 CWTs against a
+COSE_KeySet fetched from a configured URL. The wire format is CBOR
+end-to-end — no JSON or base64url anywhere in the auth path.
 
 **Token shape.** The verifier requires:
 
@@ -112,11 +115,12 @@ from a configured URL.
   the verifier requires the CWT to have been presented over a connection
   whose remote NodeId matches. If absent, the CWT is bearer-style.
 
-**JWKS handling.** One `jwks_url` in `[auth]` config. The verifier holds
-the parsed JWK set behind an `ArcSwap` and refreshes on a tokio interval
-(default 300s) plus on first cache miss (`kid` not found triggers an
-immediate refetch with a 1s minimum gap to avoid stampedes). JWK→COSE key
-conversion handles `kty = EC, crv = P-256` only.
+**Key cache.** One `cose_keys_url` in `[auth]` config. The verifier holds
+the parsed key set (`kid: Vec<u8> → p256::ecdsa::VerifyingKey`) behind an
+`ArcSwap` and refreshes on a tokio interval (default 300s) plus on first
+cache miss (`kid` not found triggers an immediate refetch with a 1s
+minimum gap to avoid stampedes). Parser accepts only `kty = EC2`,
+`crv = P-256`; other shapes are dropped at parse time with a warn log.
 
 **API.**
 
@@ -186,8 +190,8 @@ that's audit-layer data, not catalog-consumer data.
 data_dir = "/var/lib/tdf-iroh-s3/docs"   # iroh-docs storage
 
 [auth]
-jwks_url = "https://issuer.example/.well-known/jwks.json"
-issuer   = "https://issuer.example"
+cose_keys_url = "https://identity.arkavo.net/.well-known/cose-keys"
+issuer        = "https://identity.arkavo.net"
 refresh_interval_secs = 300
 # Optional, defaults to 60 seconds in either direction.
 clock_skew_secs = 60
@@ -205,11 +209,11 @@ and can be cleaned up later.
 
 | File | Change |
 |------|--------|
-| `Cargo.toml` | Add `iroh-docs`, `coset`, `ciborium`, `p256`, `arc-swap`, `reqwest` (already present? check), `base64` |
+| `Cargo.toml` | Add `iroh-docs`, `coset`, `ciborium`, `p256`, `arc-swap`, `reqwest`, `base64` |
 | `src/config.rs` | Add `CatalogConfig` and `AuthConfig` sections |
 | `src/auth/mod.rs` | New module |
 | `src/auth/cwt.rs` | COSE_Sign1 parse + verify |
-| `src/auth/jwks.rs` | JWKS fetch, cache, refresh, JWK→COSE key |
+| `src/auth/cose_keys.rs` | COSE_KeySet fetch (CBOR), parse, cache, refresh |
 | `src/auth/test_signer.rs` (cfg(test)) | In-test issuer for unit + integration tests |
 | `src/catalog/mod.rs` | `EventAuthorization` field; `build_catalog` unchanged |
 | `src/catalog/types.rs` | Add `EventAuthorization`; replace `Catalog` (versioned + signed) with `CatalogView` (entries only); keep `CatalogEntry` wire-compatible |
@@ -230,7 +234,8 @@ and can be cleaned up later.
   them. Anyone who knows a blob hash and can reach the node can still
   fetch the blob (access control is the TDF encryption layer's job, per
   `CLAUDE.md`).
-- **Multi-issuer / multi-JWKS.** Single issuer, single JWKS URL.
+- **Multi-issuer / multi-key-endpoint.** Single issuer, single
+  COSE_KeySet URL.
 - **Replay cache for `cti`.** The verifier logs `cti` but does not store
   it. Replay protection is left to short `exp` lifetimes and `cnf`
   binding.

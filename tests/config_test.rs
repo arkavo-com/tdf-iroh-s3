@@ -1,38 +1,50 @@
 use tdf_iroh_s3::config::Config;
 
+const TEST_AUTH: &str = r#"
+[auth]
+cose_keys_url = "https://issuer.example/.well-known/cose-keys"
+issuer = "https://issuer.example"
+"#;
+
 #[test]
 fn test_config_default_data_dir() {
-    let toml_str = r#"
+    let toml_str = format!(
+        r#"
 [s3]
 bucket = "test-bucket"
 region = "us-east-1"
-"#;
-    let config: Config = toml::from_str(toml_str).unwrap();
+{TEST_AUTH}"#
+    );
+    let config: Config = toml::from_str(&toml_str).unwrap();
     assert_eq!(config.iroh.data_dir, "/var/lib/tdf-iroh-s3/data");
 }
 
 #[test]
 fn test_config_custom_data_dir() {
-    let toml_str = r#"
+    let toml_str = format!(
+        r#"
 [iroh]
 data_dir = "/tmp/my-data"
 
 [s3]
 bucket = "test-bucket"
 region = "us-east-1"
-"#;
-    let config: Config = toml::from_str(toml_str).unwrap();
+{TEST_AUTH}"#
+    );
+    let config: Config = toml::from_str(&toml_str).unwrap();
     assert_eq!(config.iroh.data_dir, "/tmp/my-data");
 }
 
 #[test]
 fn test_parse_minimal_config() {
-    let toml_str = r#"
+    let toml_str = format!(
+        r#"
 [s3]
 bucket = "test-bucket"
 region = "us-east-1"
-"#;
-    let config: Config = toml::from_str(toml_str).unwrap();
+{TEST_AUTH}"#
+    );
+    let config: Config = toml::from_str(&toml_str).unwrap();
     assert_eq!(config.s3.bucket, "test-bucket");
     assert_eq!(config.s3.region, "us-east-1");
     assert_eq!(config.iroh.bind_port, 11204);
@@ -41,8 +53,78 @@ region = "us-east-1"
 }
 
 #[test]
-fn test_parse_full_config() {
+fn test_config_default_catalog_data_dir() {
     let toml_str = r#"
+[s3]
+bucket = "test-bucket"
+region = "us-east-1"
+
+[auth]
+cose_keys_url = "https://issuer.example/.well-known/cose-keys"
+issuer = "https://issuer.example"
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    assert_eq!(config.catalog.data_dir, "/var/lib/tdf-iroh-s3/docs");
+}
+
+#[test]
+fn test_config_auth_required() {
+    let toml_str = r#"
+[s3]
+bucket = "test-bucket"
+region = "us-east-1"
+"#;
+    let err = toml::from_str::<Config>(toml_str).unwrap_err();
+    assert!(err.to_string().contains("auth"), "expected auth-missing error, got: {err}");
+}
+
+#[test]
+fn test_config_auth_defaults() {
+    let toml_str = r#"
+[s3]
+bucket = "test-bucket"
+region = "us-east-1"
+
+[auth]
+cose_keys_url = "https://issuer.example/.well-known/cose-keys"
+issuer = "https://issuer.example"
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    assert_eq!(
+        config.auth.cose_keys_url,
+        "https://issuer.example/.well-known/cose-keys"
+    );
+    assert_eq!(config.auth.issuer, "https://issuer.example");
+    assert_eq!(config.auth.refresh_interval_secs, 300);
+    assert_eq!(config.auth.clock_skew_secs, 60);
+}
+
+#[test]
+fn test_config_auth_custom() {
+    let toml_str = r#"
+[s3]
+bucket = "test-bucket"
+region = "us-east-1"
+
+[auth]
+cose_keys_url = "https://issuer.example/.well-known/cose-keys"
+issuer = "https://issuer.example"
+refresh_interval_secs = 60
+clock_skew_secs = 5
+
+[catalog]
+data_dir = "/tmp/my-docs"
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    assert_eq!(config.auth.refresh_interval_secs, 60);
+    assert_eq!(config.auth.clock_skew_secs, 5);
+    assert_eq!(config.catalog.data_dir, "/tmp/my-docs");
+}
+
+#[test]
+fn test_parse_full_config() {
+    let toml_str = format!(
+        r#"
 [iroh]
 bind_port = 9999
 secret_key_param = "/my-app/node-secret-key"
@@ -60,8 +142,9 @@ required_attributes = [
 [validation.assertion]
 enabled = true
 trusted_public_keys = ["/tmp/key1.pem", "/tmp/key2.pem"]
-"#;
-    let config: Config = toml::from_str(toml_str).unwrap();
+{TEST_AUTH}"#
+    );
+    let config: Config = toml::from_str(&toml_str).unwrap();
     assert_eq!(config.iroh.bind_port, 9999);
     assert_eq!(config.iroh.secret_key_param, "/my-app/node-secret-key");
     assert_eq!(config.s3.prefix, "blobs/");
