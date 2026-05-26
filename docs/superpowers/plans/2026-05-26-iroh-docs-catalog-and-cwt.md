@@ -192,28 +192,40 @@ payload).
 
 ## Phase B — Catalog replica (parallelizable with Phase A)
 
-### Task B1: Persist author + namespace identity
+### Task B1: Persist namespace identity
 
-**Files:** `src/secret_key.rs`, `src/node.rs`, `src/config.rs`
+**Files:** `src/catalog/replica.rs`, `src/node.rs`, `src/config.rs`
 
-- [ ] **Step 1: Generalize parameter helper**
+**As-built note:** the plan originally proposed generalizing
+`secret_key.rs` to also persist a catalog author secret and namespace
+secret in SSM. After exploring iroh-docs 0.97, that turned out to be
+overreach: the docs runtime's persistent storage (`docs.redb` under
+`[catalog] data_dir`) already manages its own author and namespace
+secrets and exposes `DocsApi::author_default()` / `open(id)` to retrieve
+them. We only need to persist the *public* `NamespaceId` (32 bytes) so
+subsequent boots know which replica to reopen. That's handled in
+`replica.rs::open_or_create` via a small `catalog.namespace_id` file
+under the catalog data dir.
 
-  Rename `load_or_create` to take a `kind: KeyKind` (NodeSecret,
-  CatalogAuthor, CatalogNamespace) and route each kind to a distinct SSM
-  parameter name / dev file. Encode/decode as needed per kind
-  (NodeSecret = 32 bytes; CatalogAuthor = iroh-docs author secret;
-  CatalogNamespace = iroh-docs `NamespaceSecret`).
+- [x] **Step 1: Inline namespace-id file persistence**
 
-- [ ] **Step 2: Test — round-trip each kind**
+  `read_namespace_id`/`write_namespace_id` helpers in
+  `catalog/replica.rs`. On first boot the file doesn't exist, we call
+  `docs.create()` and write the 32-byte id. On subsequent boots we read
+  the file and call `docs.open(id)`.
 
-  In-process file-backed test asserting create-then-load returns the
-  same key for each kind.
+- [x] **Step 2: Test — namespace id persists across reopens**
+
+  `namespace_id_persists_via_id_file` in
+  `tests/catalog_event_log_test.rs`: open the replica twice through the
+  same `Docs` runtime, assert the returned `namespace_id()` matches,
+  and assert the on-disk file is 32 bytes equal to `id.as_bytes()`.
 
 ### Task B2: `CatalogReplica` wrapper
 
 **Files:** `src/catalog/replica.rs`, `src/catalog/mod.rs`
 
-- [ ] **Step 1: Skeleton**
+- [x] **Step 1: Skeleton**
 
   ```rust
   pub struct CatalogReplica { /* iroh-docs Doc + Author */ }
@@ -230,14 +242,14 @@ payload).
   }
   ```
 
-- [ ] **Step 2: Failing test — append then list round-trips**
+- [x] **Step 2: Failing test — append then list round-trips**
 
   In `tests/catalog_event_log_test.rs` (rewrite), use a temp-dir iroh-docs
   store, append three events with different `creator_id`s, assert
   `list_events("creator_1")` returns exactly the ones with that id, in
   seq order.
 
-- [ ] **Step 3: Implement `append_event`**
+- [x] **Step 3: Implement `append_event`**
 
   - Compute `next_seq` = `max(parse_event_seq(key)) + 1` over existing
     keys under `creators/{creator_id}/events/`.
@@ -247,18 +259,18 @@ payload).
   - On `iroh-docs` author-collision (concurrent writer chose the same
     `seq`) retry up to 32 times — mirrors `MAX_EVENT_APPEND_RETRIES`.
 
-- [ ] **Step 4: Implement `list_events`**
+- [x] **Step 4: Implement `list_events`**
 
   `Doc::get_many` with prefix `creators/{creator_id}/events/`, deserialize
   each entry's bytes into `PublishEvent`, return sorted by `seq`.
 
-- [ ] **Step 5: All tests pass**
+- [x] **Step 5: All tests pass**
 
 ### Task B3: Rewrite `publish_content`
 
 **Files:** `src/catalog/publish.rs`, `src/catalog/types.rs`
 
-- [ ] **Step 1: Add `EventAuthorization`**
+- [x] **Step 1: Add `EventAuthorization`**
 
   ```rust
   pub struct EventAuthorization {
@@ -269,7 +281,7 @@ payload).
   ```
   Add `pub authorization: EventAuthorization` to `PublishEvent`.
 
-- [ ] **Step 2: Rewrite signature**
+- [x] **Step 2: Rewrite signature**
 
   ```rust
   pub async fn publish_content(
@@ -282,7 +294,7 @@ payload).
   ```
   The `creator_id` is `auth.creator_id` — no longer a free parameter.
 
-- [ ] **Step 3: Body**
+- [x] **Step 3: Body**
 
   1. Write payload to S3 (idempotent, as today).
   2. Write per-content manifest to S3 (as today).
@@ -294,7 +306,7 @@ payload).
      the event log is canonical; projections are reader-side and
      disposable.
 
-- [ ] **Step 4: Delete obsolete code**
+- [x] **Step 4: Delete obsolete code**
 
   Remove `load_events`, `next_event_seq`, S3 event-key writes,
   `catalog_snapshot_key`, `catalog_latest_key`, `CatalogSignature`,
@@ -304,7 +316,7 @@ payload).
   pure-function tests accordingly (they should now assert on entries
   only, not signatures).
 
-- [ ] **Step 5: Failing tests, then passing**
+- [x] **Step 5: Failing tests, then passing**
 
   Tests in `tests/catalog_publish_auth_test.rs`:
   - Publish with valid CWT for `creator_1` → succeeds, event in replica.
@@ -312,6 +324,17 @@ payload).
     `creator_1` → reject (the new signature makes this representationally
     impossible; assert at the verifier-bound boundary instead — i.e.
     `auth.creator_id` is the source of truth).
+
+  **As-built note:** the structural test ("sub mismatch is
+  representationally impossible") is now compile-time: the
+  `publish_content` signature only accepts `auth.creator_id`, no
+  free-parameter creator_id. The full end-to-end success test requires
+  a working S3 backend; the repo's existing test pattern (`new_mock` +
+  no real S3) doesn't cover the put_object path, and adding a real S3
+  mock just for one test inflates surface area. Deferred to **Phase C**
+  where the full node wiring lands and one e2e test can exercise the
+  whole pipeline against `S3Client::new_mock` or a localstack
+  container.
   - Publish with expired CWT → verifier rejects before `publish_content`
     is reached. Cover this in `tests/auth_cwt_test.rs` not here.
 

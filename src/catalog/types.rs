@@ -22,7 +22,7 @@ pub struct ContentMetadata {
     pub required_tier_ids: Vec<String>,
 }
 
-/// Per-content manifest persisted alongside the payload.
+/// Per-content manifest persisted alongside the payload in S3.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContentManifest {
     pub content_id: String,
@@ -36,8 +36,12 @@ pub struct ContentManifest {
     pub published_at: String,
 }
 
-/// Append-only publish event. The catalog is derived deterministically from
-/// the ordered set of events for a creator.
+/// One publish event — the canonical unit in the catalog event log.
+///
+/// The log lives in an `iroh-docs` replica under
+/// `creators/{creator_id}/events/{seq:020}`. Each event carries its own
+/// CWT-derived [`EventAuthorization`] so a reader can verify the chain of
+/// custody without trusting the authoring node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublishEvent {
     pub seq: u64,
@@ -46,6 +50,20 @@ pub struct PublishEvent {
     pub kind: PublishEventKind,
     pub published_at: String,
     pub entry: CatalogEntry,
+    pub authorization: EventAuthorization,
+}
+
+/// Pinned to the CWT that authorized the publish. The token bytes are
+/// preserved verbatim so a downstream verifier can re-run signature checks
+/// against the issuer's key set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventAuthorization {
+    /// Base64 (standard, padded) of the raw COSE_Sign1 CWT.
+    pub cwt_b64: String,
+    /// Copy of the CWT `iss` claim, for indexing without re-decoding.
+    pub issuer: String,
+    /// Hex of the CWT `cti` claim, for replay-analysis tooling.
+    pub cti: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,26 +79,17 @@ pub struct CatalogEntry {
     pub published_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Catalog {
-    pub creator_id: String,
-    pub version: u64,
-    pub generated_at: String,
-    pub entries: Vec<CatalogEntry>,
-    pub signature: CatalogSignature,
-}
-
-/// Detached signature over the canonical-bytes serialization of the catalog
-/// body (everything except the `signature` field itself).
+/// A reader-side projection of the event log for a single creator.
 ///
-/// `method = "blake3-unsigned-placeholder"` is the current scheme: a BLAKE3
-/// digest of the canonical body. It is NOT cryptographically authenticated —
-/// it only detects accidental tampering. The replacement is ed25519 once a
-/// catalog signing key is wired through config.
+/// The event log is canonical; this struct is a disposable summary computed
+/// on demand and is never written back to the replica. Two callers asking
+/// for "the catalog" at the same replica state are free to compute
+/// different projections (different sorts, filters) without disagreeing
+/// about canonical state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CatalogSignature {
-    pub method: String,
-    pub value: String,
+pub struct CatalogView {
+    pub creator_id: String,
+    pub entries: Vec<CatalogEntry>,
 }
 
 /// Outcome of a successful publish.
@@ -88,5 +97,4 @@ pub struct CatalogSignature {
 pub struct PublishOutcome {
     pub content_id: String,
     pub seq: u64,
-    pub version: u64,
 }

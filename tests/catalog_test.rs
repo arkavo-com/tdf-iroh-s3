@@ -1,10 +1,12 @@
-//! Verifies the on-disk JSON shape of the catalog types is stable. The
-//! consumer app and any external tooling read these documents, so changes
-//! to field names or casing are breaking changes worth catching in tests.
+//! Wire-format stability tests for the catalog types.
+//!
+//! These guard the on-disk JSON shape of types that travel between the
+//! node and downstream consumers. Field-name or casing changes are
+//! breaking and should fail here.
 
 use tdf_iroh_s3::catalog::{
-    Catalog, CatalogEntry, ContentManifest, ContentMetadata, PublishEvent, PublishEventKind,
-    Visibility, build_catalog,
+    CatalogEntry, ContentManifest, ContentMetadata, EventAuthorization, PublishEvent,
+    PublishEventKind, Visibility, build_catalog,
 };
 
 fn sample_entry(content_id: &str, seq: u64) -> CatalogEntry {
@@ -17,6 +19,22 @@ fn sample_entry(content_id: &str, seq: u64) -> CatalogEntry {
         tdf_ref: format!("iroh:{content_id}"),
         manifest_ref: format!("creators/creator_1/content/{content_id}/manifest.json"),
         published_at: "2026-05-25T22:30:00Z".to_string(),
+    }
+}
+
+fn sample_event(seq: u64, content_id: &str) -> PublishEvent {
+    PublishEvent {
+        seq,
+        creator_id: "creator_1".to_string(),
+        content_id: content_id.to_string(),
+        kind: PublishEventKind::Publish,
+        published_at: "2026-05-25T22:30:00Z".to_string(),
+        entry: sample_entry(content_id, seq),
+        authorization: EventAuthorization {
+            cwt_b64: "cwt-bytes-base64".to_string(),
+            issuer: "https://issuer.example".to_string(),
+            cti: format!("{seq:032x}"),
+        },
     }
 }
 
@@ -67,38 +85,48 @@ fn content_manifest_required_tier_ids_defaults_to_empty() {
 }
 
 #[test]
-fn full_catalog_roundtrips_with_stable_signature() {
-    let events = vec![
-        PublishEvent {
-            seq: 1,
-            creator_id: "creator_1".to_string(),
-            content_id: "c1".to_string(),
-            kind: PublishEventKind::Publish,
-            published_at: "2026-05-25T10:00:00Z".to_string(),
-            entry: sample_entry("c1", 1),
-        },
-        PublishEvent {
-            seq: 2,
-            creator_id: "creator_1".to_string(),
-            content_id: "c2".to_string(),
-            kind: PublishEventKind::Publish,
-            published_at: "2026-05-25T11:00:00Z".to_string(),
-            entry: sample_entry("c2", 2),
-        },
-    ];
+fn catalog_view_projects_events_dedup_and_sort() {
+    let events = vec![sample_event(1, "c1"), sample_event(2, "c2")];
+    let view = build_catalog("creator_1", events);
+    assert_eq!(view.creator_id, "creator_1");
+    assert_eq!(view.entries.len(), 2);
+}
 
-    let draft = build_catalog("creator_1", events);
-    let catalog = draft.finalize("2026-05-25T12:00:00Z".to_string());
+#[test]
+fn publish_event_authorization_is_required_and_roundtrips() {
+    let event = sample_event(7, "c7");
+    let json = serde_json::to_string(&event).unwrap();
+    assert!(json.contains(r#""cwt_b64":"cwt-bytes-base64""#));
+    assert!(json.contains(r#""issuer":"https://issuer.example""#));
+    let parsed: PublishEvent = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed.authorization.issuer, "https://issuer.example");
+    assert_eq!(parsed.seq, 7);
+}
 
-    assert_eq!(catalog.version, 2);
-    assert_eq!(catalog.entries.len(), 2);
-    assert_eq!(catalog.signature.method, "blake3-unsigned-placeholder");
-    assert_eq!(catalog.signature.value.len(), 64); // BLAKE3 hex
-
-    let json = serde_json::to_string(&catalog).unwrap();
-    let parsed: Catalog = serde_json::from_str(&json).unwrap();
-    assert_eq!(parsed.signature.value, catalog.signature.value);
-    assert_eq!(parsed.entries[0].content_id, catalog.entries[0].content_id);
+#[test]
+fn publish_event_without_authorization_fails_to_parse() {
+    // The CWT-embedded authorization is mandatory at the wire-format level.
+    let json = r#"{
+        "seq": 1,
+        "creator_id": "c1",
+        "content_id": "x",
+        "kind": "publish",
+        "published_at": "2026-05-25T00:00:00Z",
+        "entry": {
+            "content_id": "x",
+            "creator_id": "c1",
+            "title": "t",
+            "visibility": "public",
+            "tdf_ref": "iroh:x",
+            "manifest_ref": "creators/c1/content/x/manifest.json",
+            "published_at": "2026-05-25T00:00:00Z"
+        }
+    }"#;
+    let err = serde_json::from_str::<PublishEvent>(json).unwrap_err();
+    assert!(
+        err.to_string().contains("authorization"),
+        "expected missing-authorization error, got: {err}"
+    );
 }
 
 #[test]

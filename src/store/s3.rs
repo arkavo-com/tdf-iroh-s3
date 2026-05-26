@@ -10,16 +10,6 @@ pub struct S3Client {
     prefix: String,
 }
 
-/// Outcome of a conditional PUT (`If-None-Match: *`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConditionalPut {
-    /// The object did not exist; write succeeded.
-    Wrote,
-    /// An object already existed at this key; write was rejected by the
-    /// precondition (HTTP 412).
-    PreconditionFailed,
-}
-
 impl S3Client {
     /// Create a new S3 client using the default AWS credential chain (IAM role on EC2).
     pub async fn new(bucket: &str, region: &str, prefix: &str) -> Result<Self> {
@@ -224,38 +214,6 @@ impl S3Client {
             .await
             .with_context(|| format!("Failed to PUT object '{key}' to S3"))?;
         Ok(())
-    }
-
-    /// PUT raw bytes only if the key does not already exist (`If-None-Match: *`).
-    /// Returns [`ConditionalPut::PreconditionFailed`] if an object exists.
-    pub async fn put_object_bytes_if_none_match(
-        &self,
-        key: &str,
-        data: Bytes,
-    ) -> Result<ConditionalPut> {
-        let res = self
-            .client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .if_none_match("*")
-            .body(data.into())
-            .send()
-            .await;
-
-        match res {
-            Ok(_) => Ok(ConditionalPut::Wrote),
-            Err(e) => {
-                let status = e.raw_response().map(|r| r.status().as_u16());
-                if status == Some(412) {
-                    Ok(ConditionalPut::PreconditionFailed)
-                } else {
-                    Err(anyhow::anyhow!(
-                        "Failed conditional PUT for key '{key}': {e}"
-                    ))
-                }
-            }
-        }
     }
 
     /// HEAD a generic key. Returns `true` if the object exists, `false` for 404.

@@ -56,6 +56,8 @@ thiserror = "2"
 bytes = "1"
 hex = "0.4"
 rand = "0.9"
+futures-lite = "2.6.1"
+iroh-gossip = "0.97"
 
 [dev-dependencies]
 tempfile = "3"
