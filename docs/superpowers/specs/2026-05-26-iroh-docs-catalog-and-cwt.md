@@ -23,6 +23,30 @@ Blob push/get over `iroh-blobs` is **out of scope** for CWT gating — that
 layer keeps its current NodeId-based access pattern through the existing
 `ProviderMessage` hooks.
 
+## Canonical model
+
+**The event log is the catalog.** Each event in the iroh-docs replica is
+the authoritative record of one publish, authenticated by the CWT
+embedded in it. Anything else that calls itself a "catalog" — the
+in-memory `Catalog` struct returned by `build_catalog`, a JSON blob
+served over HTTP, a sorted slice handed to a UI — is a *projection* of
+the event log: derived at read time, disposable, never written back, and
+not required to be byte-identical between callers.
+
+Consequences for this spec:
+
+- No `version`, `generated_at`, or `signature` on the projection. Per-event
+  authenticity is already provided by the CWT in the event payload; a
+  signature over a derived view adds no security and invites confusion
+  about which form is canonical.
+- No catalog snapshot writes. The replica is the single source of truth.
+- `regenerate_catalog` is renamed `project_catalog` to make
+  disposability obvious in the code.
+- Two callers asking for "the catalog" at the same replica state are
+  free to return different shapes (e.g., filtered by visibility, sorted
+  by title rather than `published_at`) without disagreeing about
+  canonical state.
+
 ## Design
 
 ### Catalog in iroh-docs
@@ -59,12 +83,16 @@ event payload* (see `PublishEvent.authorization` below) so the chain of
 custody is auditable from the replica alone — a verifier doesn't need to
 trust the node's author key, only the issuer's JWKS.
 
-**Catalog materialization.** `crate::catalog::build_catalog` is unchanged.
-A new `regenerate_catalog(replica, creator_id)` reads all entries under
-`creators/{creator_id}/events/`, deserializes them into `PublishEvent`,
-calls `build_catalog`, and returns the in-memory `Catalog`. The result is
-never written back to the replica — it's a pure function of the replica
-state at read time.
+**Catalog projection.** `crate::catalog::build_catalog` keeps its
+dedup/sort semantics but its return type loses `version`,
+`generated_at`, and `signature`. A new
+`project_catalog(replica, creator_id) -> CatalogView` reads all entries
+under `creators/{creator_id}/events/`, deserializes them into
+`PublishEvent`, calls `build_catalog`, and returns the in-memory
+`CatalogView { creator_id, entries }`. The result is never written back
+to the replica and has no on-the-wire identity — callers that need a
+versionable handle should reference the event log directly (e.g. by max
+seq observed).
 
 ### CWT verifier
 
@@ -184,7 +212,7 @@ and can be cleaned up later.
 | `src/auth/jwks.rs` | JWKS fetch, cache, refresh, JWK→COSE key |
 | `src/auth/test_signer.rs` (cfg(test)) | In-test issuer for unit + integration tests |
 | `src/catalog/mod.rs` | `EventAuthorization` field; `build_catalog` unchanged |
-| `src/catalog/types.rs` | Add `EventAuthorization`; keep `Catalog`/`CatalogEntry` wire-compatible |
+| `src/catalog/types.rs` | Add `EventAuthorization`; replace `Catalog` (versioned + signed) with `CatalogView` (entries only); keep `CatalogEntry` wire-compatible |
 | `src/catalog/replica.rs` | New: `CatalogReplica` wrapper around `iroh-docs` doc |
 | `src/catalog/publish.rs` | Rewrite: take `VerifiedClaims`, write to replica instead of S3 event log |
 | `src/catalog/keys.rs` | Replica key helpers (drop S3-specific catalog snapshot keys) |
@@ -215,5 +243,7 @@ and can be cleaned up later.
   completely.** They go away in `publish.rs` rewrite, but the S3 key
   helpers in `keys.rs` are kept (still used by the payload + per-content
   manifest paths).
-- **Ed25519 catalog signature.** The placeholder BLAKE3 signature in
-  `CatalogDraft::finalize` stays for now; it's orthogonal to write auth.
+- **Signing the projection.** Not needed — the event log is canonical
+  and each event is CWT-authenticated. The placeholder
+  `CatalogSignature` / `CatalogDraft::finalize` machinery is removed
+  along with `Catalog.version` and `Catalog.generated_at`.

@@ -9,13 +9,15 @@ replica, and gate every write to that replica with a CWT (COSE_Sign1)
 verified against a JWKS URL in config.
 
 **Architecture:** One node-local `iroh-docs` replica holds all publish
-events under `creators/{creator_id}/events/{seq:020}` keys. The node owns
-a single iroh-docs author identity. A `crate::auth::Verifier` checks
-incoming CWTs (algorithm ES256, issuer from config, claims pinned to
-`creator_id` + `campaign_id` + `catalog.write` scope). On success the node
-authors the event and embeds the raw CWT in the event payload for audit.
-Catalogs are materialized on demand from replica contents; nothing is
-written back.
+events under `creators/{creator_id}/events/{seq:020}` keys. **The event
+log is the canonical catalog** — every other "catalog" in the codebase
+is a disposable projection of it. The node owns a single iroh-docs
+author identity. A `crate::auth::Verifier` checks incoming CWTs
+(algorithm ES256, issuer from config, claims pinned to `creator_id` +
+`campaign_id` + `catalog.write` scope). On success the node authors the
+event and embeds the raw CWT in the event payload for audit. Nothing is
+written back to the replica besides events — no snapshots, no signed
+projection.
 
 **Tech Stack:** `iroh-docs` 0.99, `coset` 0.3 (COSE_Sign1), `ciborium`
 (CBOR), `p256` (ES256 verify), `arc-swap` (JWKS cache), `reqwest` (JWKS
@@ -35,8 +37,8 @@ fetch), `base64`.
 | `src/auth/cwt.rs` | Create | COSE_Sign1 parse + signature verify + claim checks |
 | `src/auth/jwks.rs` | Create | JWKS fetch, parse, cache, JWK→COSE-key |
 | `src/auth/test_signer.rs` | Create (cfg test/feature) | Test fixture that mints valid CWTs |
-| `src/catalog/types.rs` | Modify | Add `EventAuthorization`; extend `PublishEvent` |
-| `src/catalog/mod.rs` | Modify | Re-export; `build_catalog` unchanged |
+| `src/catalog/types.rs` | Modify | Add `EventAuthorization`; extend `PublishEvent`; replace `Catalog` with `CatalogView { creator_id, entries }`; delete `CatalogSignature`, `CatalogDraft` |
+| `src/catalog/mod.rs` | Modify | `build_catalog` now returns `CatalogView`; delete `finalize`, `canonical_json`, `sign_placeholder` |
 | `src/catalog/keys.rs` | Modify | Add replica-key helpers; remove catalog-snapshot S3 keys |
 | `src/catalog/replica.rs` | Create | `CatalogReplica` wrapper: open, write event, list events |
 | `src/catalog/publish.rs` | Rewrite | Take `VerifiedClaims`, write to replica, drop S3 event-log writes |
@@ -270,17 +272,19 @@ fetch), `base64`.
   4. Build `PublishEvent` with `authorization = EventAuthorization {
      cwt_b64: base64(auth.raw_cwt), issuer: ..., cti: auth.cti }`.
   5. `replica.append_event(&event)` → returns `seq`.
-  6. Return `PublishOutcome { content_id, seq, version: seq }`. (No more
-     in-bucket catalog snapshot; `version` is just the seq the event
-     landed at — `regenerate_catalog` is now called by readers, not the
-     publisher.)
+  6. Return `PublishOutcome { content_id, seq }`. No `version` field —
+     the event log is canonical; projections are reader-side and
+     disposable.
 
 - [ ] **Step 4: Delete obsolete code**
 
   Remove `load_events`, `next_event_seq`, S3 event-key writes,
-  `catalog_snapshot_key`, `catalog_latest_key` write paths from
-  `publish.rs` and `keys.rs`. Keep `content_payload_key`,
-  `content_manifest_key`.
+  `catalog_snapshot_key`, `catalog_latest_key`, `CatalogSignature`,
+  `CatalogDraft`, `sign_placeholder`, `canonical_json`, and all related
+  tests. Keep `content_payload_key`, `content_manifest_key`. Update
+  `build_catalog` to return `CatalogView` and adjust the existing
+  pure-function tests accordingly (they should now assert on entries
+  only, not signatures).
 
 - [ ] **Step 5: Failing tests, then passing**
 
@@ -375,6 +379,8 @@ fetch), `base64`.
 - [ ] Top-of-module doc on `src/catalog/replica.rs` explaining the
   one-replica-per-node model and the `creators/{creator_id}/events/{seq}`
   key layout, with the same level of detail as the current `mod.rs` doc.
+  Lead with the canonical-model statement: "The event log in this replica
+  is the catalog. `CatalogView` is a disposable projection."
 - [ ] Top-of-module doc on `src/auth/mod.rs` listing supported algorithms
   (ES256 only) and explicitly noting the unverified surface (no `cti`
   replay cache).
