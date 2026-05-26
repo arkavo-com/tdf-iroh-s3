@@ -7,11 +7,16 @@ use iroh_blobs::provider::events::{
 };
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::BlobsProtocol;
+use iroh_docs::protocol::Docs;
+use iroh_gossip::net::Gossip;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use crate::auth::{CoseKeyCache, Verifier};
+use crate::catalog::replica::CatalogReplica;
 use crate::config::Config;
 use crate::ingest::ingest_from_store;
 use crate::secret_key;
@@ -23,6 +28,8 @@ pub struct TdfIrohNode {
     endpoint: Endpoint,
     pub s3_client: Arc<S3Client>,
     pub config: Arc<Config>,
+    pub catalog: Arc<CatalogReplica>,
+    pub verifier: Arc<Verifier>,
     cancel: CancellationToken,
 }
 
@@ -74,9 +81,49 @@ impl TdfIrohNode {
         let (event_sender, event_rx) = EventSender::channel(64, mask);
 
         let blobs = BlobsProtocol::new(&store, Some(event_sender));
+        let blobs_store: iroh_blobs::api::Store = (*store).clone();
+
+        // Gossip + Docs runtime — needed to host the catalog replica that
+        // holds the publish event log.
+        let gossip = Gossip::builder().spawn(endpoint.clone());
+        let docs = Docs::persistent(std::path::PathBuf::from(&config.catalog.data_dir))
+            .spawn(endpoint.clone(), blobs_store.clone(), gossip.clone())
+            .await
+            .context("Failed to spawn iroh-docs runtime")?;
+
+        let namespace_id_path =
+            std::path::PathBuf::from(&config.catalog.data_dir).join("catalog.namespace_id");
+        let catalog = Arc::new(
+            CatalogReplica::open_or_create(&docs, blobs_store.clone(), namespace_id_path)
+                .await
+                .context("Failed to open catalog replica")?,
+        );
+        info!(
+            namespace_id = %catalog.namespace_id(),
+            "catalog replica ready"
+        );
+
+        // CWT verifier (COSE keys fetched from config-supplied endpoint).
+        let http_client = reqwest::Client::builder()
+            .build()
+            .context("Failed to build reqwest client")?;
+        let keys = CoseKeyCache::spawn(
+            config.auth.cose_keys_url.clone(),
+            Duration::from_secs(config.auth.refresh_interval_secs),
+            http_client,
+        )
+        .await
+        .context("Failed to spawn COSE key cache")?;
+        let verifier = Arc::new(Verifier::new(
+            keys,
+            config.auth.issuer.clone(),
+            config.auth.clock_skew_secs,
+        ));
 
         let router = Router::builder(endpoint.clone())
             .accept(iroh_blobs::ALPN, blobs)
+            .accept(iroh_docs::ALPN, docs.clone())
+            .accept(iroh_gossip::ALPN, gossip.clone())
             .spawn();
 
         let addr = endpoint.addr();
@@ -99,6 +146,8 @@ impl TdfIrohNode {
             endpoint,
             s3_client,
             config,
+            catalog,
+            verifier,
             cancel,
         })
     }

@@ -8,16 +8,17 @@
 //! served via the network protocol). We verify accessibility by fetching the
 //! blob back from the node over the iroh-blobs GET protocol.
 
+use std::path::Path;
 use tdf_iroh_s3::config::{AuthConfig, CatalogConfig, Config, IrohConfig, S3Config, ValidationConfig};
 use tdf_iroh_s3::node::TdfIrohNode;
 use tdf_iroh_s3::test_cli::iroh_client::IrohTestClient;
 
-fn test_config(data_dir: &str) -> Config {
+fn test_config(tmp_dir: &Path) -> Config {
     Config {
         iroh: IrohConfig {
             bind_port: 0, // Random port
             secret_key_param: String::new(),
-            data_dir: data_dir.to_string(),
+            data_dir: tmp_dir.join("iroh").to_str().unwrap().to_string(),
         },
         s3: S3Config {
             bucket: "test-bucket".to_string(),
@@ -25,9 +26,14 @@ fn test_config(data_dir: &str) -> Config {
             prefix: String::new(),
         },
         validation: ValidationConfig::default(),
-        catalog: CatalogConfig::default(),
+        catalog: CatalogConfig {
+            data_dir: tmp_dir.join("docs").to_str().unwrap().to_string(),
+        },
+        // Bogus URL — CoseKeyCache::spawn logs the initial-fetch failure
+        // and returns an empty cache. The node still boots; we don't
+        // exercise the verifier in these tests.
         auth: AuthConfig {
-            cose_keys_url: "https://issuer.example/.well-known/cose-keys".to_string(),
+            cose_keys_url: "http://127.0.0.1:1/.well-known/cose-keys".to_string(),
             issuer: "https://issuer.example".to_string(),
             refresh_interval_secs: 300,
             clock_skew_secs: 60,
@@ -46,10 +52,18 @@ async fn test_push_blob_stored_in_node() {
     }
 
     let tmp_dir = tempfile::tempdir().unwrap();
-    let config = test_config(tmp_dir.path().to_str().unwrap());
+    let config = test_config(tmp_dir.path());
 
     let node = TdfIrohNode::spawn(config).await.unwrap();
     let node_id = node.addr().id;
+
+    // Phase C smoke check: catalog replica is alive and addressable.
+    let ns_id = node.catalog.namespace_id();
+    assert_ne!(
+        ns_id.as_bytes(),
+        &[0u8; 32],
+        "catalog namespace id must be initialised on spawn"
+    );
 
     // Create a valid TDF blob
     let tdf_bytes = create_test_tdf();
@@ -80,7 +94,7 @@ async fn test_push_invalid_blob_does_not_crash_node() {
     }
 
     let tmp_dir = tempfile::tempdir().unwrap();
-    let config = test_config(tmp_dir.path().to_str().unwrap());
+    let config = test_config(tmp_dir.path());
 
     let node = TdfIrohNode::spawn(config).await.unwrap();
     let node_id = node.addr().id;

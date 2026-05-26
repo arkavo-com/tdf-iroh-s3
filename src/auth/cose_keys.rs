@@ -38,8 +38,11 @@ pub struct CoseKeyCache {
 
 impl CoseKeyCache {
     /// Construct a cache backed by an HTTP COSE_KeySet endpoint and spawn a
-    /// background refresh task. The initial fetch runs synchronously so the
-    /// cache is usable on return.
+    /// background refresh task. An initial fetch is attempted
+    /// synchronously; if it fails, the cache stays empty (verify calls
+    /// will trigger a force_refresh on first miss) and a warning is
+    /// logged. We deliberately do not fail node boot on initial fetch
+    /// errors so a brief upstream outage cannot bring the node down.
     pub async fn spawn(
         url: String,
         refresh_interval: Duration,
@@ -52,10 +55,14 @@ impl CoseKeyCache {
             last_force_refresh: Mutex::new(None),
         });
 
-        let initial = fetch_and_parse(&http, &url)
-            .await
-            .with_context(|| format!("initial COSE_KeySet fetch from {url}"))?;
-        cache.keys.store(Arc::new(initial));
+        match fetch_and_parse(&http, &url).await {
+            Ok(initial) => cache.keys.store(Arc::new(initial)),
+            Err(e) => warn!(
+                url = %url,
+                error = %e,
+                "initial COSE_KeySet fetch failed; cache will populate on first verify miss"
+            ),
+        }
 
         let weak = Arc::downgrade(&cache);
         tokio::spawn(async move {

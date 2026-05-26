@@ -346,7 +346,7 @@ under the catalog data dir.
 
 **Files:** `src/node.rs`, `src/config.rs`
 
-- [ ] **Step 1: Hold both on the node**
+- [x] **Step 1: Hold both on the node**
 
   ```rust
   pub struct TdfIrohNode {
@@ -356,40 +356,60 @@ under the catalog data dir.
   }
   ```
 
-- [ ] **Step 2: Spawn-time setup**
+- [x] **Step 2: Spawn-time setup**
 
   Inside `TdfIrohNode::spawn`:
-  - Load/create the catalog `NamespaceSecret` and `AuthorId` via the
-    generalized `secret_key` helper.
-  - Open `iroh-docs::Docs::persistent(&config.catalog.data_dir)`.
-  - Open the replica via `CatalogReplica::open_or_create`.
-  - Build the HTTP client + spawn `JwksCache`.
-  - Build `Verifier { jwks: cache, issuer: config.auth.issuer.clone(),
-    clock_skew_secs: config.auth.clock_skew_secs }`.
+  - Spawn `Gossip::builder().spawn(endpoint.clone())`.
+  - Spawn `Docs::persistent(&config.catalog.data_dir).spawn(endpoint,
+    blobs, gossip)`.
+  - Open the replica via `CatalogReplica::open_or_create(&docs,
+    blobs_store, namespace_id_path)` where `namespace_id_path` is
+    `{config.catalog.data_dir}/catalog.namespace_id`.
+  - Spawn `CoseKeyCache` from `config.auth.cose_keys_url`. Initial
+    fetch failures are logged-and-tolerated so a brief upstream outage
+    or a bogus test URL doesn't block node boot.
+  - Build `Verifier::new(keys, issuer, clock_skew_secs)`.
+  - Register all three ALPNs (`iroh_blobs::ALPN`, `iroh_docs::ALPN`,
+    `iroh_gossip::ALPN`) on the router.
 
-- [ ] **Step 3: Smoke test**
+- [x] **Step 3: Smoke test**
 
-  `tests/node_ingest_test.rs` already exists; add an assertion that the
-  spawned node exposes a non-empty `catalog.namespace_id()`.
+  `tests/node_ingest_test.rs`: `test_push_blob_stored_in_node` now
+  asserts `node.catalog.namespace_id() != [0; 32]`. The `test_config`
+  helper takes a tmp `Path` and derives separate `iroh` and `docs`
+  subdirectories so the catalog data dir doesn't collide with
+  `/var/lib/tdf-iroh-s3/docs`.
 
-### Task C2: Update test CLI
+### Task C2: CLI publish path — **deferred**
 
 **Files:** `src/test_cli/push.rs`
 
-- [ ] **Step 1: Mint CWT path**
+This task can't ship in Phase C as originally drafted. The plan
+envisaged the CLI calling `publish_content` directly after verifying a
+CWT, but:
 
-  `--cwt <PATH>` accepts a path to a CWT file (raw bytes). For dev
-  convenience, `--cwt-test` activates the test signer behind a
-  feature-gated path that prints a warning and mints a CWT inline using a
-  fixture key.
+- `publish_content` needs a `&CatalogReplica`, which is a handle to the
+  *running node's* docs runtime. Two processes cannot share one
+  `docs.redb` (it's a `redb` lockfile).
+- A CLI binary that opens its own docs runtime against the same data
+  dir would deadlock with a running node, and a node-spawning CLI
+  binary defeats the point of having a separate test client.
 
-- [ ] **Step 2: Pass through to publish**
+The right shape is a custom RPC ALPN on the node — something like
+`tdf-iroh-s3/publish/v1` — that accepts a `(cwt, metadata, blob_hash)`
+tuple, verifies the CWT server-side, and calls `publish_content`. That
+ALPN is its own design + tests + wire format and belongs in a follow-up
+plan.
 
-  `push` calls `verifier.verify(&cwt_bytes, None)` then forwards the
-  resulting `VerifiedClaims` to `publish_content`.
+For now, **`push_tdf` is unchanged**: it pushes a blob over
+`iroh-blobs` as before. No catalog event is recorded — the catalog
+publish path is reachable only from in-process callers of
+`publish_content`, which lets us land the auth + replica machinery
+without committing to a wire format prematurely.
 
-- [ ] **Step 3: `cargo run --bin tdf-iroh-s3-test -- push --cwt-test ...`
-  succeeds end-to-end against a local node**
+- [ ] **(deferred)** Custom publish-RPC ALPN
+- [ ] **(deferred)** `--cwt <PATH>` / `--cwt-test` flags on the CLI
+- [ ] **(deferred)** End-to-end CLI → node publish smoke test
 
 ---
 
