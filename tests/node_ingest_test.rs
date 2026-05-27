@@ -9,7 +9,7 @@
 //! blob back from the node over the iroh-blobs GET protocol.
 
 use std::path::Path;
-use tdf_iroh_s3::config::{AuthConfig, CatalogConfig, Config, IrohConfig, S3Config, ValidationConfig};
+use tdf_iroh_s3::config::{AuthConfig, CatalogConfig, Config, IrohConfig, PdpConfig, S3Config, ValidationConfig};
 use tdf_iroh_s3::node::TdfIrohNode;
 use tdf_iroh_s3::test_cli::iroh_client::IrohTestClient;
 
@@ -28,6 +28,8 @@ fn test_config(tmp_dir: &Path) -> Config {
         validation: ValidationConfig::default(),
         catalog: CatalogConfig {
             data_dir: tmp_dir.join("docs").to_str().unwrap().to_string(),
+            max_subscriptions_per_peer: 4,
+            max_subscriptions_total: 256,
         },
         // Bogus URL — CoseKeyCache::spawn logs the initial-fetch failure
         // and returns an empty cache. The node still boots; we don't
@@ -37,6 +39,10 @@ fn test_config(tmp_dir: &Path) -> Config {
             issuer: "https://issuer.example".to_string(),
             refresh_interval_secs: 300,
             clock_skew_secs: 60,
+        },
+        pdp: PdpConfig {
+            attribute_defs_url: "http://127.0.0.1:1/.well-known/attributes".to_string(),
+            refresh_interval_secs: 300,
         },
     }
 }
