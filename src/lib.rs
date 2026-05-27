@@ -3,6 +3,7 @@ pub mod catalog;
 pub mod config;
 pub mod ingest;
 pub mod node;
+pub mod pdp;
 pub mod secret_key;
 pub mod store;
 pub mod test_cli;
