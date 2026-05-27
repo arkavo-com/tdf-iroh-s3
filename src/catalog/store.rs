@@ -136,4 +136,8 @@ impl EventStore {
         let _ = self.tx.send(event.clone());
         Ok(event)
     }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<ContentEvent> {
+        self.tx.subscribe()
+    }
 }

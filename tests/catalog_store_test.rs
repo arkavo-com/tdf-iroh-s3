@@ -65,3 +65,24 @@ async fn list_from_returns_events_in_seq_order() {
     while let Some(evt) = stream.next().await { after.push(evt.unwrap()); }
     assert_eq!(after.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![3, 4]);
 }
+
+#[tokio::test]
+async fn subscribe_receives_events_appended_after_subscription() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = EventStore::open(&dir.path().join("events.redb")).await.unwrap();
+    store.append(sample("pre")).await.unwrap();
+
+    let mut rx = store.subscribe();
+    let store2 = std::sync::Arc::new(store);
+    let s2 = store2.clone();
+    let handle = tokio::spawn(async move {
+        s2.append(sample("post1")).await.unwrap();
+        s2.append(sample("post2")).await.unwrap();
+    });
+    handle.await.unwrap();
+
+    let a = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await.unwrap().unwrap();
+    let b = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await.unwrap().unwrap();
+    assert_eq!(a.content_id, "post1");
+    assert_eq!(b.content_id, "post2");
+}
