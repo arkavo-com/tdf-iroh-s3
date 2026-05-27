@@ -11,6 +11,7 @@
 
 pub mod cose_keys;
 pub mod cwt;
+pub mod pep_check;
 
 #[cfg(any(test, feature = "test-fixtures"))]
 pub mod test_signer;
