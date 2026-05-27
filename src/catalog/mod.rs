@@ -16,6 +16,7 @@
 pub mod keys;
 pub mod publish;
 pub mod replica;
+pub mod store;
 pub mod types;
 
 pub use types::*;
