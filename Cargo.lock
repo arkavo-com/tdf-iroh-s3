@@ -5228,6 +5228,7 @@ dependencies = [
  "redb",
  "reqwest 0.13.4",
  "serde",
+ "serde_bytes",
  "serde_json",
  "tdf-iroh-s3",
  "tempfile",

@@ -86,3 +86,20 @@ async fn subscribe_receives_events_appended_after_subscription() {
     assert_eq!(a.content_id, "post1");
     assert_eq!(b.content_id, "post2");
 }
+
+#[tokio::test]
+async fn write_then_read_request_roundtrip() {
+    use std::io::Cursor;
+    use tdf_iroh_s3::protocol::catalog_read::{CatalogSubscribe, read_request, write_frame};
+
+    let req = CatalogSubscribe {
+        cwt: serde_bytes::ByteBuf::from(b"hi".to_vec()),
+        after_seq: Some(7),
+    };
+    let mut buf: Vec<u8> = Vec::new();
+    write_frame(&mut buf, &req).await.unwrap();
+    let mut cur = Cursor::new(buf);
+    let parsed = read_request(&mut cur).await.unwrap();
+    assert_eq!(&parsed.cwt[..], b"hi");
+    assert_eq!(parsed.after_seq, Some(7));
+}
