@@ -98,3 +98,45 @@ fn extracts_fqns_from_nested_boolean_policy() {
         ]
     );
 }
+
+/// Present-operator conditions are skipped (assert existence without a specific
+/// value); only concrete-value conditions contribute to the extracted FQNs.
+#[test]
+fn present_operator_conditions_are_skipped() {
+    use opentdf::{AttributeCondition, AttributeIdentifier, AttributePolicy, AttributeValue, Operator};
+
+    // Build a manifest with both a concrete-value condition AND a Present-operator condition.
+    // Only the concrete-value FQN should be extracted.
+    let cond_concrete = AttributePolicy::Condition(AttributeCondition {
+        attribute: AttributeIdentifier::new("example.com", "clearance"),
+        operator: Operator::Equals,
+        value: Some(AttributeValue::String("secret".to_string())),
+    });
+    let cond_present = AttributePolicy::Condition(AttributeCondition {
+        attribute: AttributeIdentifier::new("example.com", "department"),
+        operator: Operator::Present,
+        value: None,
+    });
+    let nested = AttributePolicy::and(vec![cond_concrete, cond_present]);
+
+    let policy = opentdf::Policy::new(
+        "a1b2c3d4-e5f6-7890-abcd-ef1234567890".to_string(),
+        vec![nested],
+        vec!["test@example.com".to_string()],
+    );
+
+    let tdf_bytes = Tdf::encrypt(b"test payload")
+        .kas_url("https://kas.example.com")
+        .policy(policy)
+        .to_bytes()
+        .expect("encrypt TDF");
+
+    let manifest = validate_tdf_structure(&tdf_bytes).expect("parse manifest");
+    let fqns = manifest_attr_value_fqns(&manifest).expect("extract FQNs");
+
+    // Only the concrete-value FQN should be present; Present operator is skipped.
+    assert_eq!(
+        fqns,
+        vec!["https://example.com/attr/clearance/value/secret".to_string()]
+    );
+}

@@ -42,8 +42,13 @@ fn collect_fqns(policy: &AttributePolicy, out: &mut Vec<String>) {
                 );
                 out.push(fqn.to_url());
             }
-            // Conditions with no value or non-string values (Present, NotPresent, arrays, …)
-            // do not identify a specific attribute value and are intentionally skipped.
+            // We only extract a concrete attribute-value FQN. Skip:
+            // - Operator::Present / NotPresent: assert existence with no specific value.
+            // - Array-valued operators (In/AnyOf/AllOf/MinimumOf/MaximumOf): v1 PDP checks
+            //   only against equality-style FQNs; richer matchers come later.
+            // Leaving these out keeps the catalog event's attribute_value_fqns vector
+            // tight; the PDP will simply not match the affected resource against any
+            // reader.
         }
         AttributePolicy::Logical(logical) => match logical {
             LogicalOperator::AND { conditions } | LogicalOperator::OR { conditions } => {
