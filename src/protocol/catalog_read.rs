@@ -102,10 +102,10 @@ impl SubscriptionLimits {
     }
 
     fn try_acquire(&self, peer: &str) -> bool {
+        let mut map = self.per_peer.lock();
         if self.total.load(Ordering::SeqCst) >= self.max_total {
             return false;
         }
-        let mut map = self.per_peer.lock();
         let count = map.entry(peer.to_string()).or_insert(0);
         if *count >= self.max_per_peer {
             return false;
@@ -188,11 +188,21 @@ where
     let pdp = deps.pdp.load();
     let action = Action::new("read");
 
+    // Subscribe BEFORE the backfill snapshot so live events appended during
+    // drain are buffered into the receiver instead of dropped.
+    let mut live = deps.store.subscribe();
+
+    // Snapshot tail at subscribe time; backfill covers (after, snapshot_tail].
+    let snapshot_tail = deps.store.current_tail();
+
     // Backfill
     let after = req.after_seq.unwrap_or(0);
     let mut bf = deps.store.list_from(after).await.context("list_from")?;
     while let Some(ev) = futures_lite::StreamExt::next(&mut bf).await {
         let ev = ev?;
+        if ev.seq > snapshot_tail {
+            continue; // upper bound = snapshot_tail; live loop will cover the rest
+        }
         let allow = pdp
             .check(&entitlements, &action, &ev.attribute_value_fqns)
             .map(|d| d.is_allow())
@@ -201,12 +211,11 @@ where
             write_frame(&mut write, &CatalogStreamMsg::Entry(ev)).await?;
         }
     }
-    let tail = deps.store.current_tail();
-    write_frame(&mut write, &CatalogStreamMsg::CaughtUp { seq: tail }).await?;
+    write_frame(&mut write, &CatalogStreamMsg::CaughtUp { seq: snapshot_tail }).await?;
 
     // Live
-    let mut live = deps.store.subscribe();
     let mut hb = tokio::time::interval(HEARTBEAT_INTERVAL);
+    hb.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     hb.tick().await;
     let mut warned = false;
     loop {
@@ -218,6 +227,9 @@ where
             }
             ev = live.recv() => match ev {
                 Ok(ev) => {
+                    if ev.seq <= snapshot_tail {
+                        continue; // already covered by backfill
+                    }
                     let allow = pdp
                         .check(&entitlements, &action, &ev.attribute_value_fqns)
                         .map(|d| d.is_allow())
@@ -248,8 +260,9 @@ where
                 if !warned && now >= claims.exp - TOKEN_WARNING_LEAD {
                     write_frame(&mut write, &CatalogStreamMsg::TokenExpiringSoon { exp: claims.exp }).await?;
                     warned = true;
+                } else {
+                    write_frame(&mut write, &CatalogStreamMsg::Heartbeat).await?;
                 }
-                write_frame(&mut write, &CatalogStreamMsg::Heartbeat).await?;
             }
         }
     }
