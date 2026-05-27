@@ -29,7 +29,3 @@ pub const SCOPE_CATALOG_READ: &str = "catalog.read";
 /// (Appendix A.3). Unknown action names reject the **whole token**.
 pub const ACTION_READ: &str = "read";
 
-/// Legacy publisher-side scope retained until Task 12 rewrites
-/// `test_signer`. Do not consume from new code — read paths require
-/// [`SCOPE_CATALOG_READ`] and the publisher path is being reworked.
-pub const SCOPE_CATALOG_WRITE: &str = "catalog.write";

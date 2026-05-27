@@ -1,9 +1,9 @@
 //! In-process CWT issuer used by unit and integration tests.
 //!
-//! Generates a P-256 keypair, exposes the public half as JWKS JSON, and
-//! mints COSE_Sign1 CWTs signed by the private half. Not behind a
-//! `feature = "test-fixtures"` switch in the public API because nothing
-//! outside of tests links it.
+//! Mints Arkavo CWT v1 contract-conforming tokens: ES256 COSE_Sign1 with
+//! `iss`, `sub`, `iat`, `exp` (windowed to <=3600s), `scope: catalog.read`,
+//! `cnf.iroh_node_id` as a 32-byte byte string, and a non-empty
+//! `authorization_details` array of `tdf_attribute` grants with `read` actions.
 
 use ciborium::Value;
 use coset::cwt::{ClaimsSetBuilder, Timestamp};
@@ -60,30 +60,55 @@ impl TestSigner {
         CoseKeyCache::new_static(map, bytes::Bytes::from(self.cose_key_set()))
     }
 
-    /// Mint a CWT for the given claims.
+    /// Mint a v1-contract CWT.
     pub fn mint(&self, claims: TestClaims) -> Vec<u8> {
+        // Build authorization_details array
+        let auth_details = Value::Array(
+            claims
+                .grants
+                .into_iter()
+                .map(|g| {
+                    Value::Map(vec![
+                        (Value::Text("type".into()), Value::Text(g.grant_type)),
+                        (Value::Text("fqn".into()), Value::Text(g.fqn)),
+                        (
+                            Value::Text("actions".into()),
+                            Value::Array(g.actions.into_iter().map(Value::Text).collect()),
+                        ),
+                    ])
+                })
+                .collect(),
+        );
+
         let mut builder = ClaimsSetBuilder::new()
             .issuer(claims.issuer.unwrap_or_else(|| self.issuer.clone()))
             .subject(claims.subject)
             .issued_at(Timestamp::WholeSeconds(claims.iat))
             .expiration_time(Timestamp::WholeSeconds(claims.exp));
+
         if let Some(cti) = claims.cti {
             builder = builder.cwt_id(cti);
         }
-        // scope claim (9, RFC 8693)
+
+        // scope (integer-9 IANA key)
         builder = builder.claim(iana::CwtClaimName::Scope, Value::Text(claims.scope));
-        // campaign_id (text claim, project-specific)
-        builder = builder.text_claim(
-            "campaign_id".to_string(),
-            Value::Text(claims.campaign_id),
-        );
-        if let Some(node_id) = claims.cnf_iroh_node_id {
+
+        // authorization_details (text key per contract A.2)
+        builder = builder.text_claim("authorization_details".into(), auth_details);
+
+        // cnf.iroh_node_id as BYTE STRING (32 bytes), inside cnf (integer 8) map
+        if let Some(node_id_hex) = claims.cnf_iroh_node_id {
+            // Caller passes a hex string; decode to bytes.
+            let node_id_bytes = hex::decode(&node_id_hex)
+                .expect("test cnf.iroh_node_id must be valid hex");
+            assert_eq!(node_id_bytes.len(), 32, "iroh_node_id must be 32 bytes");
             let cnf = Value::Map(vec![(
-                Value::Text("iroh_node_id".to_string()),
-                Value::Text(node_id),
+                Value::Text("iroh_node_id".into()),
+                Value::Bytes(node_id_bytes),
             )]);
             builder = builder.claim(iana::CwtClaimName::Cnf, cnf);
         }
+
         let claims_set = builder.build();
         let payload = claims_set
             .to_vec()
@@ -94,12 +119,12 @@ impl TestSigner {
             .key_id(self.kid.clone())
             .build();
 
-        let signing_key = self.signing_key.clone();
+        let sk = self.signing_key.clone();
         let sign1 = CoseSign1Builder::new()
             .protected(protected)
             .payload(payload)
             .create_signature(&[], move |tbs| {
-                let sig: Signature = signing_key.sign(tbs);
+                let sig: Signature = sk.sign(tbs);
                 sig.to_bytes().to_vec()
             })
             .build();
@@ -108,33 +133,51 @@ impl TestSigner {
     }
 }
 
+/// One `authorization_details` entry to be minted into the token.
+pub struct TestGrant {
+    pub grant_type: String,
+    pub fqn: String,
+    pub actions: Vec<String>,
+}
+
+impl TestGrant {
+    pub fn read(fqn: impl Into<String>) -> Self {
+        Self {
+            grant_type: "tdf_attribute".into(),
+            fqn: fqn.into(),
+            actions: vec!["read".into()],
+        }
+    }
+}
+
 pub struct TestClaims {
     pub subject: String,
-    pub campaign_id: String,
     pub scope: String,
     pub iat: i64,
     pub exp: i64,
     pub cti: Option<Vec<u8>>,
+    /// Hex-encoded 32-byte iroh NodeId. The signer asserts validity on mint.
     pub cnf_iroh_node_id: Option<String>,
     pub issuer: Option<String>,
+    pub grants: Vec<TestGrant>,
 }
 
 impl TestClaims {
-    /// Sensible default: catalog.write scope, valid for the next 5 minutes.
-    pub fn defaults(subject: impl Into<String>, campaign_id: impl Into<String>) -> Self {
+    /// Defaults: `catalog.read` scope, valid for 5 minutes, one grant.
+    pub fn defaults(subject: impl Into<String>, fqn: impl Into<String>) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
         Self {
             subject: subject.into(),
-            campaign_id: campaign_id.into(),
-            scope: "catalog.write".to_string(),
+            scope: "catalog.read".into(),
             iat: now,
             exp: now + 300,
             cti: Some(b"test-cti-001".to_vec()),
             cnf_iroh_node_id: None,
             issuer: None,
+            grants: vec![TestGrant::read(fqn.into())],
         }
     }
 }
