@@ -11,6 +11,7 @@
 
 pub mod cose_keys;
 pub mod cwt;
+pub mod entitlements;
 pub mod pep_check;
 
 #[cfg(any(test, feature = "test-fixtures"))]
@@ -18,6 +19,7 @@ pub mod test_signer;
 
 pub use cose_keys::CoseKeyCache;
 pub use cwt::{Grant, VerifiedClaims, VerifyError, Verifier};
+pub use entitlements::cwt_to_entitlements;
 
 /// Required `scope` value at the catalog read ALPN per Arkavo CWT v1
 /// (Appendix A.2 of the reader-side spec).
