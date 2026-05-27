@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use iroh_blobs::Hash;
 use iroh_blobs::store::fs::FsStore;
+use opentdf::TdfManifest;
 use tracing::info;
 
 use crate::config::ValidationConfig;
@@ -46,6 +47,57 @@ pub async fn ingest_blob(
 
     info!(hash = %hash_hex, size, "Blob ingested and stored to S3");
     Ok(IngestResult { hash_hex, size })
+}
+
+/// Result of `ingest_from_store_with_manifest`: the ingest result plus the
+/// parsed TDF manifest for downstream FQN extraction.
+pub struct IngestOutcome {
+    pub result: IngestResult,
+    pub manifest: TdfManifest,
+}
+
+/// Like `ingest_from_store` but also returns the parsed TDF manifest so the
+/// caller can extract attribute-value FQNs for the catalog event.
+pub async fn ingest_from_store_with_manifest(
+    hash: Hash,
+    store: &FsStore,
+    validation_config: &crate::config::ValidationConfig,
+    s3_client: &S3Client,
+) -> Result<Option<IngestOutcome>> {
+    let data = match store.get_bytes(hash).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::trace!(%hash, error = %e, "blob not yet readable");
+            return Ok(None);
+        }
+    };
+
+    // Run the full validation pipeline (structure + attributes + assertion).
+    crate::validation::validate_blob(&data, validation_config)
+        .context("Blob rejected by validation")?;
+
+    // Re-parse the manifest for FQN extraction. validate_tdf_structure already
+    // parses it; we call it again here to keep ingest decoupled from validation
+    // internals. The cost is a second ZIP parse on a blob that already passed.
+    let manifest = crate::validation::structure::validate_tdf_structure(&data)
+        .context("re-parse manifest for catalog event")?;
+
+    let bhash = blake3::hash(&data);
+    let hash_hex = bhash.to_hex().to_string();
+    let size = data.len() as u64;
+
+    if !s3_client.has_blob(&hash_hex).await? {
+        s3_client
+            .put_blob(&hash_hex, Bytes::copy_from_slice(&data))
+            .await
+            .context("Failed to upload blob to S3")?;
+    }
+
+    info!(hash = %hash_hex, size, "Blob ingested + manifest captured");
+    Ok(Some(IngestOutcome {
+        result: IngestResult { hash_hex, size },
+        manifest,
+    }))
 }
 
 /// Read a blob from the FsStore by hash, validate it, and upload to S3.

@@ -10,13 +10,14 @@ use iroh_blobs::BlobsProtocol;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
+use time;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::auth::{CoseKeyCache, Verifier};
 use crate::catalog::store::EventStore;
+use crate::catalog::types::NewContentEvent;
 use crate::config::Config;
-use crate::ingest::ingest_from_store;
 use crate::pdp::cache::AccessPdpCache;
 use crate::protocol::catalog_read::{
     self, CatalogReadDeps, SubscriptionLimits,
@@ -246,9 +247,6 @@ async fn run_ingest_loop(
     cancel: CancellationToken,
 ) {
     info!("Ingest loop started");
-    // `catalog` is threaded through so Task 17 can append on successful ingest
-    // without changing this signature again. Currently unused.
-    let _ = &catalog;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -315,7 +313,6 @@ async fn wait_and_ingest(
     config: &Config,
     catalog: &EventStore,
 ) {
-    let _ = catalog; // Task 17 will append a ContentEvent on successful ingest.
     // Wait for the push transfer to complete
     let mut completed = false;
     while let Ok(Some(update)) = rx.recv().await {
@@ -341,15 +338,50 @@ async fn wait_and_ingest(
         info!(%hash, "Push notification received, checking store");
     }
 
-    // Blob is written — ingest with small retry for FsStore async DB propagation
+    // Blob is written — ingest with small retry for FsStore async DB propagation.
+    // On success, extract FQNs from the manifest and append a ContentEvent.
     for attempt in 0..10 {
-        match ingest_from_store(hash, store, &config.validation, s3_client).await {
-            Ok(Some(result)) => {
-                info!(
-                    hash = %result.hash_hex,
-                    size = result.size,
-                    "Blob ingested successfully"
+        match crate::ingest::ingest_from_store_with_manifest(
+            hash,
+            store,
+            &config.validation,
+            s3_client,
+        )
+        .await
+        {
+            Ok(Some(outcome)) => {
+                let fqns = match crate::pdp::policy_extract::manifest_attr_value_fqns(
+                    &outcome.manifest,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(hash = %outcome.result.hash_hex, error = %e,
+                              "policy FQN extract failed; appending event with empty FQNs");
+                        Vec::new()
+                    }
+                };
+                let ingested_at = time::OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
+                let manifest_ref = format!(
+                    "{}blobs/{}.manifest",
+                    s3_client.prefix(),
+                    outcome.result.hash_hex
                 );
+                if let Err(e) = catalog
+                    .append(NewContentEvent {
+                        content_id: outcome.result.hash_hex.clone(),
+                        manifest_ref,
+                        attribute_value_fqns: fqns,
+                        ingested_at,
+                    })
+                    .await
+                {
+                    error!(hash = %outcome.result.hash_hex, error = %e,
+                           "EventStore append failed");
+                }
+                info!(hash = %outcome.result.hash_hex, size = outcome.result.size,
+                      "Blob ingested + event appended");
                 return;
             }
             Ok(None) => {
