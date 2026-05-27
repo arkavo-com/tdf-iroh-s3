@@ -8,16 +8,61 @@
 //! served via the network protocol). We verify accessibility by fetching the
 //! blob back from the node over the iroh-blobs GET protocol.
 
-use tdf_iroh_s3::config::{Config, IrohConfig, S3Config, ValidationConfig};
+use std::path::Path;
+use std::sync::Arc;
+use tdf_iroh_s3::auth::test_signer::TestSigner;
+use tdf_iroh_s3::config::{AuthConfig, CatalogConfig, Config, IrohConfig, PdpConfig, S3Config, ValidationConfig};
 use tdf_iroh_s3::node::TdfIrohNode;
 use tdf_iroh_s3::test_cli::iroh_client::IrohTestClient;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
-fn test_config(data_dir: &str) -> Config {
-    Config {
+/// Spin up a minimal in-process HTTP server that serves `body` forever.
+/// Returns the base URL (e.g. `http://127.0.0.1:PORT`).
+async fn serve_static(body: Vec<u8>, content_type: &'static str) -> String {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let body = Arc::new(body);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = listener.accept().await else { return };
+            let body = Arc::clone(&body);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf).await;
+                let h = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    content_type,
+                    body.len()
+                );
+                let _ = s.write_all(h.as_bytes()).await;
+                let _ = s.write_all(&body).await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+async fn test_config_with_fixtures(tmp_dir: &Path) -> (Config, TestSigner) {
+    let issuer = "https://issuer.example".to_string();
+    let signer = TestSigner::new(&issuer);
+
+    // COSE keys: serve the signer's published keyset.
+    let cose_keys_url = serve_static(
+        signer.cose_key_set(),
+        "application/cose-key-set+cbor",
+    )
+    .await;
+
+    // PDP: serve an empty attribute set (valid JSON for AccessPdp::new).
+    let attribute_defs_url = serve_static(b"[]".to_vec(), "application/json").await;
+
+    let config = Config {
         iroh: IrohConfig {
-            bind_port: 0, // Random port
+            bind_port: 0,
             secret_key_param: String::new(),
-            data_dir: data_dir.to_string(),
+            data_dir: tmp_dir.join("iroh").to_str().unwrap().to_string(),
         },
         s3: S3Config {
             bucket: "test-bucket".to_string(),
@@ -25,7 +70,23 @@ fn test_config(data_dir: &str) -> Config {
             prefix: String::new(),
         },
         validation: ValidationConfig::default(),
-    }
+        catalog: CatalogConfig {
+            data_dir: tmp_dir.join("catalog").to_str().unwrap().to_string(),
+            max_subscriptions_per_peer: 4,
+            max_subscriptions_total: 256,
+        },
+        auth: AuthConfig {
+            cose_keys_url,
+            issuer,
+            refresh_interval_secs: 300,
+            clock_skew_secs: 60,
+        },
+        pdp: PdpConfig {
+            attribute_defs_url,
+            refresh_interval_secs: 300,
+        },
+    };
+    (config, signer)
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -39,10 +100,14 @@ async fn test_push_blob_stored_in_node() {
     }
 
     let tmp_dir = tempfile::tempdir().unwrap();
-    let config = test_config(tmp_dir.path().to_str().unwrap());
+    let (config, _signer) = test_config_with_fixtures(tmp_dir.path()).await;
 
     let node = TdfIrohNode::spawn(config).await.unwrap();
     let node_id = node.addr().id;
+
+    // Smoke check: EventStore opened cleanly (tail is 0 on a fresh DB).
+    let tail = node.catalog.current_tail();
+    assert_eq!(tail, 0, "fresh EventStore should have tail 0");
 
     // Create a valid TDF blob
     let tdf_bytes = create_test_tdf();
@@ -73,7 +138,7 @@ async fn test_push_invalid_blob_does_not_crash_node() {
     }
 
     let tmp_dir = tempfile::tempdir().unwrap();
-    let config = test_config(tmp_dir.path().to_str().unwrap());
+    let (config, _signer) = test_config_with_fixtures(tmp_dir.path()).await;
 
     let node = TdfIrohNode::spawn(config).await.unwrap();
     let node_id = node.addr().id;

@@ -5,13 +5,14 @@ edition = "2024"
 rust-version = "1.91"
 
 [dependencies]
-# Iroh networking and blobs
+# Iroh networking, blobs, and replicated docs
 iroh = "0.97"
+iroh-base = "0.97"
 iroh-blobs = "0.99"
 irpc = "0.13"
 
 # OpenTDF validation
-opentdf = { git = "https://github.com/arkavo-org/opentdf-rs", default-features = false }
+opentdf = { git = "https://github.com/arkavo-org/opentdf-rs", tag = "0.12.0", default-features = false }
 
 # AWS S3
 aws-config = { version = "1", features = ["behavior-version-latest"] }
@@ -21,6 +22,14 @@ aws-sdk-ssm = "1"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
+
+# CWT / COSE / JWKS
+coset = "0.4"
+ciborium = "0.2"
+p256 = { version = "0.13", features = ["ecdsa"] }
+arc-swap = "1"
+base64 = "0.22"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 
 # Hashing
 blake3 = "1"
@@ -34,7 +43,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Serialization / config
 serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+serde_json = "1"
 toml = "0.8"
+time = { version = "0.3", features = ["formatting"] }
 
 # Error handling
 anyhow = "1"
@@ -44,11 +56,21 @@ thiserror = "2"
 bytes = "1"
 hex = "0.4"
 rand = "0.9"
-iroh-base = "0.97"
+futures-lite = "2.6.1"
+
+# Embedded database
+redb = "2"
+parking_lot = "0.12"
 
 [dev-dependencies]
 tempfile = "3"
 zip = "2.2"
+tdf-iroh-s3 = { path = ".", features = ["test-fixtures"] }
+
+[features]
+default = []
+# Exposes auth::test_signer for use from integration tests and dev tooling.
+test-fixtures = []
 
 [[bin]]
 name = "tdf-iroh-s3-test"

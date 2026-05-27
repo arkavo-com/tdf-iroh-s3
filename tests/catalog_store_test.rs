@@ -1,0 +1,105 @@
+use futures_lite::StreamExt;
+use tdf_iroh_s3::catalog::store::EventStore;
+use tdf_iroh_s3::catalog::types::NewContentEvent;
+
+fn sample(content_id: &str) -> NewContentEvent {
+    NewContentEvent {
+        content_id: content_id.to_string(),
+        manifest_ref: format!("manifests/{content_id}.json"),
+        attribute_value_fqns: vec!["https://example/attr/a/value/x".to_string()],
+        ingested_at: "2026-05-26T00:00:00Z".to_string(),
+    }
+}
+
+#[tokio::test]
+async fn append_assigns_monotonic_seq_starting_at_1() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = EventStore::open(&dir.path().join("events.redb")).await.unwrap();
+
+    let e1 = store.append(sample("aaa")).await.unwrap();
+    let e2 = store.append(sample("bbb")).await.unwrap();
+    let e3 = store.append(sample("ccc")).await.unwrap();
+
+    assert_eq!(e1.seq, 1);
+    assert_eq!(e2.seq, 2);
+    assert_eq!(e3.seq, 3);
+    assert_eq!(store.current_tail(), 3);
+}
+
+#[tokio::test]
+async fn current_tail_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("events.redb");
+
+    {
+        let s = EventStore::open(&path).await.unwrap();
+        s.append(sample("x")).await.unwrap();
+        s.append(sample("y")).await.unwrap();
+    }
+
+    let reopened = EventStore::open(&path).await.unwrap();
+    assert_eq!(reopened.current_tail(), 2);
+
+    let e3 = reopened.append(sample("z")).await.unwrap();
+    assert_eq!(e3.seq, 3);
+}
+
+#[tokio::test]
+async fn list_from_returns_events_in_seq_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = EventStore::open(&dir.path().join("events.redb")).await.unwrap();
+    for id in ["a", "b", "c", "d"] {
+        store.append(sample(id)).await.unwrap();
+    }
+
+    let mut stream = store.list_from(0).await.unwrap();
+    let mut seen = Vec::new();
+    while let Some(evt) = stream.next().await {
+        seen.push(evt.unwrap());
+    }
+    assert_eq!(seen.iter().map(|e| e.content_id.as_str()).collect::<Vec<_>>(),
+               vec!["a", "b", "c", "d"]);
+
+    let mut stream = store.list_from(2).await.unwrap();
+    let mut after = Vec::new();
+    while let Some(evt) = stream.next().await { after.push(evt.unwrap()); }
+    assert_eq!(after.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![3, 4]);
+}
+
+#[tokio::test]
+async fn subscribe_receives_events_appended_after_subscription() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = EventStore::open(&dir.path().join("events.redb")).await.unwrap();
+    store.append(sample("pre")).await.unwrap();
+
+    let mut rx = store.subscribe();
+    let store2 = std::sync::Arc::new(store);
+    let s2 = store2.clone();
+    let handle = tokio::spawn(async move {
+        s2.append(sample("post1")).await.unwrap();
+        s2.append(sample("post2")).await.unwrap();
+    });
+    handle.await.unwrap();
+
+    let a = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await.unwrap().unwrap();
+    let b = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await.unwrap().unwrap();
+    assert_eq!(a.content_id, "post1");
+    assert_eq!(b.content_id, "post2");
+}
+
+#[tokio::test]
+async fn write_then_read_request_roundtrip() {
+    use std::io::Cursor;
+    use tdf_iroh_s3::protocol::catalog_read::{CatalogSubscribe, read_request, write_frame};
+
+    let req = CatalogSubscribe {
+        cwt: serde_bytes::ByteBuf::from(b"hi".to_vec()),
+        after_seq: Some(7),
+    };
+    let mut buf: Vec<u8> = Vec::new();
+    write_frame(&mut buf, &req).await.unwrap();
+    let mut cur = Cursor::new(buf);
+    let parsed = read_request(&mut cur).await.unwrap();
+    assert_eq!(&parsed.cwt[..], b"hi");
+    assert_eq!(parsed.after_seq, Some(7));
+}

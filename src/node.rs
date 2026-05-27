@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use iroh::endpoint::presets;
-use iroh::protocol::Router;
+use iroh::endpoint::{presets, Connection};
+use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr};
 use iroh_blobs::provider::events::{
     EventMask, EventSender, ProviderMessage, RequestMode, RequestUpdate,
@@ -9,11 +9,19 @@ use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::BlobsProtocol;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
+use std::time::Duration;
+use time;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use crate::auth::{CoseKeyCache, Verifier};
+use crate::catalog::store::EventStore;
+use crate::catalog::types::NewContentEvent;
 use crate::config::Config;
-use crate::ingest::ingest_from_store;
+use crate::pdp::cache::AccessPdpCache;
+use crate::protocol::catalog_read::{
+    self, CatalogReadDeps, SubscriptionLimits,
+};
 use crate::secret_key;
 use crate::store::s3::S3Client;
 
@@ -23,11 +31,20 @@ pub struct TdfIrohNode {
     endpoint: Endpoint,
     pub s3_client: Arc<S3Client>,
     pub config: Arc<Config>,
+    pub catalog: Arc<EventStore>,
+    pub verifier: Arc<Verifier>,
+    pub pdp: Arc<AccessPdpCache>,
     cancel: CancellationToken,
 }
 
 impl TdfIrohNode {
     pub async fn spawn(config: Config) -> Result<Self> {
+        // Fail-closed: required auth/PDP URLs must be present before we bind
+        // anything externally observable.
+        config
+            .validate()
+            .context("invalid node configuration")?;
+
         let config = Arc::new(config);
 
         let s3_client = Arc::new(
@@ -65,8 +82,6 @@ impl TdfIrohNode {
         // NotifyLog on `get` enables event delivery for ALL request types (get, push, etc.)
         // and provides a RequestUpdate stream to track transfer completion.
         // Note: EventSender::request() checks only mask.get, not mask.push.
-        // Notify on `get` enables event delivery for ALL request types (get, push, etc.)
-        // Note: EventSender::request() checks only mask.get, not mask.push.
         let mask = EventMask {
             get: RequestMode::Notify,
             ..EventMask::DEFAULT
@@ -75,8 +90,61 @@ impl TdfIrohNode {
 
         let blobs = BlobsProtocol::new(&store, Some(event_sender));
 
+        // Local redb-backed event log. Single-author (this node).
+        let catalog_path =
+            std::path::PathBuf::from(&config.catalog.data_dir).join("events.redb");
+        let catalog = Arc::new(
+            EventStore::open(&catalog_path)
+                .await
+                .context("Failed to open EventStore")?,
+        );
+        info!(path = %catalog_path.display(), "EventStore ready");
+
+        // Shared HTTP client for COSE keyset + PDP attribute-defs fetches.
+        let http_client = reqwest::Client::builder()
+            .build()
+            .context("Failed to build reqwest client")?;
+
+        // AccessPdp cache — fail-closed on the boot fetch.
+        let pdp = AccessPdpCache::spawn(
+            config.pdp.attribute_defs_url.clone(),
+            Duration::from_secs(config.pdp.refresh_interval_secs),
+            http_client.clone(),
+        )
+        .await
+        .context("Failed to spawn PDP cache")?;
+
+        // CWT verifier (COSE keys fetched from config-supplied endpoint).
+        let keys = CoseKeyCache::spawn(
+            config.auth.cose_keys_url.clone(),
+            Duration::from_secs(config.auth.refresh_interval_secs),
+            http_client,
+        )
+        .await
+        .context("Failed to spawn COSE key cache")?;
+        let verifier = Arc::new(Verifier::new(
+            keys,
+            config.auth.issuer.clone(),
+            config.auth.clock_skew_secs,
+        ));
+
+        // Reader-side subscription concurrency caps.
+        let limits = SubscriptionLimits::new(
+            config.catalog.max_subscriptions_per_peer,
+            config.catalog.max_subscriptions_total,
+        );
+
+        let catalog_proto = CatalogReadProtocol {
+            verifier: Arc::clone(&verifier),
+            store: Arc::clone(&catalog),
+            pdp: Arc::clone(&pdp),
+            limits,
+            cancel: cancel.clone(),
+        };
+
         let router = Router::builder(endpoint.clone())
             .accept(iroh_blobs::ALPN, blobs)
+            .accept(catalog_read::ALPN, catalog_proto)
             .spawn();
 
         let addr = endpoint.addr();
@@ -87,9 +155,10 @@ impl TdfIrohNode {
             let store = store.clone();
             let s3_client = Arc::clone(&s3_client);
             let config = Arc::clone(&config);
+            let catalog = Arc::clone(&catalog);
             let cancel = cancel.clone();
             tokio::spawn(async move {
-                run_ingest_loop(event_rx, store, s3_client, config, cancel).await;
+                run_ingest_loop(event_rx, store, s3_client, config, catalog, cancel).await;
             });
         }
 
@@ -99,6 +168,9 @@ impl TdfIrohNode {
             endpoint,
             s3_client,
             config,
+            catalog,
+            verifier,
+            pdp,
             cancel,
         })
     }
@@ -122,11 +194,56 @@ impl TdfIrohNode {
     }
 }
 
+/// `ProtocolHandler` adapter for `tdf/catalog/1`. Each incoming QUIC
+/// connection at this ALPN gets a single bidi stream handled by
+/// [`catalog_read::handle`].
+#[derive(Clone)]
+struct CatalogReadProtocol {
+    verifier: Arc<Verifier>,
+    store: Arc<EventStore>,
+    pdp: Arc<AccessPdpCache>,
+    limits: Arc<SubscriptionLimits>,
+    cancel: CancellationToken,
+}
+
+impl std::fmt::Debug for CatalogReadProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CatalogReadProtocol").finish_non_exhaustive()
+    }
+}
+
+impl ProtocolHandler for CatalogReadProtocol {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        // Hex-lowercase EndpointId — matches the format CWT `cnf.iroh_node_id`
+        // is expected to carry (verifier hex-decodes this string).
+        let peer = connection.remote_id().to_string();
+
+        let (send, recv) = connection
+            .accept_bi()
+            .await
+            .map_err(AcceptError::from_err)?;
+
+        let deps = CatalogReadDeps {
+            verifier: Arc::clone(&self.verifier),
+            store: Arc::clone(&self.store),
+            pdp: Arc::clone(&self.pdp),
+            limits: Arc::clone(&self.limits),
+            cancel: self.cancel.clone(),
+        };
+
+        if let Err(e) = catalog_read::handle(recv, send, peer, deps).await {
+            warn!(err = %e, "catalog_read::handle returned error");
+        }
+        Ok(())
+    }
+}
+
 async fn run_ingest_loop(
     mut rx: tokio::sync::mpsc::Receiver<ProviderMessage>,
     store: FsStore,
     s3_client: Arc<S3Client>,
     config: Arc<Config>,
+    catalog: Arc<EventStore>,
     cancel: CancellationToken,
 ) {
     info!("Ingest loop started");
@@ -147,8 +264,9 @@ async fn run_ingest_loop(
                         let store = store.clone();
                         let s3_client = Arc::clone(&s3_client);
                         let config = Arc::clone(&config);
+                        let catalog = Arc::clone(&catalog);
                         tokio::spawn(async move {
-                            wait_and_ingest(hash, msg.rx, &store, &s3_client, &config).await;
+                            wait_and_ingest(hash, msg.rx, &store, &s3_client, &config, &catalog).await;
                         });
                     }
                     Some(ProviderMessage::PushRequestReceived(msg)) => {
@@ -158,8 +276,9 @@ async fn run_ingest_loop(
                         let store = store.clone();
                         let s3_client = Arc::clone(&s3_client);
                         let config = Arc::clone(&config);
+                        let catalog = Arc::clone(&catalog);
                         tokio::spawn(async move {
-                            wait_and_ingest(hash, msg.rx, &store, &s3_client, &config).await;
+                            wait_and_ingest(hash, msg.rx, &store, &s3_client, &config, &catalog).await;
                         });
                     }
                     Some(ProviderMessage::GetRequestReceivedNotify(_)) => {
@@ -192,6 +311,7 @@ async fn wait_and_ingest(
     store: &FsStore,
     s3_client: &S3Client,
     config: &Config,
+    catalog: &EventStore,
 ) {
     // Wait for the push transfer to complete
     let mut completed = false;
@@ -218,15 +338,50 @@ async fn wait_and_ingest(
         info!(%hash, "Push notification received, checking store");
     }
 
-    // Blob is written — ingest with small retry for FsStore async DB propagation
+    // Blob is written — ingest with small retry for FsStore async DB propagation.
+    // On success, extract FQNs from the manifest and append a ContentEvent.
     for attempt in 0..10 {
-        match ingest_from_store(hash, store, &config.validation, s3_client).await {
-            Ok(Some(result)) => {
-                info!(
-                    hash = %result.hash_hex,
-                    size = result.size,
-                    "Blob ingested successfully"
+        match crate::ingest::ingest_from_store_with_manifest(
+            hash,
+            store,
+            &config.validation,
+            s3_client,
+        )
+        .await
+        {
+            Ok(Some(outcome)) => {
+                let fqns = match crate::pdp::policy_extract::manifest_attr_value_fqns(
+                    &outcome.manifest,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(hash = %outcome.result.hash_hex, error = %e,
+                              "policy FQN extract failed; appending event with empty FQNs");
+                        Vec::new()
+                    }
+                };
+                let ingested_at = time::OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
+                let manifest_ref = format!(
+                    "{}blobs/{}.manifest",
+                    s3_client.prefix(),
+                    outcome.result.hash_hex
                 );
+                if let Err(e) = catalog
+                    .append(NewContentEvent {
+                        content_id: outcome.result.hash_hex.clone(),
+                        manifest_ref,
+                        attribute_value_fqns: fqns,
+                        ingested_at,
+                    })
+                    .await
+                {
+                    error!(hash = %outcome.result.hash_hex, error = %e,
+                           "EventStore append failed");
+                }
+                info!(hash = %outcome.result.hash_hex, size = outcome.result.size,
+                      "Blob ingested + event appended");
                 return;
             }
             Ok(None) => {
